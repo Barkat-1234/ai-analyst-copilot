@@ -31,7 +31,8 @@ if "question" not in st.session_state:
 if "page" not in st.session_state:
     st.session_state.page = "chat"
 
-API_URL = "http://127.0.0.1:8000"
+# IMPORTANT: Change this to your Render backend URL
+API_URL = "https://ai-analyst-copilot-2.onrender.com"
 
 # ==================== LOGIN PAGE ====================
 def show_login():
@@ -44,22 +45,28 @@ def show_login():
         submitted = st.form_submit_button("Login", type="primary", use_container_width=True)
         
         if submitted:
-            try:
-                response = requests.post(
-                    f"{API_URL}/login",
-                    json={"email": email, "password": password}
-                )
-                if response.status_code == 200:
-                    data = response.json()
-                    st.session_state.token = data["access_token"]
-                    st.session_state.user_email = data["user_email"]
-                    st.session_state.user_role = data["role"]
-                    st.success(f"✅ Welcome {email}!")
-                    st.rerun()
-                else:
-                    st.error("❌ Invalid email or password")
-            except Exception as e:
-                st.error(f"❌ Connection error: {e}")
+            if not email or not password:
+                st.error("Please enter both email and password")
+            else:
+                try:
+                    response = requests.post(
+                        f"{API_URL}/login",
+                        json={"email": email, "password": password},
+                        timeout=30
+                    )
+                    if response.status_code == 200:
+                        data = response.json()
+                        st.session_state.token = data["access_token"]
+                        st.session_state.user_email = data["user_email"]
+                        st.session_state.user_role = data["role"]
+                        st.success(f"✅ Welcome {email}!")
+                        st.rerun()
+                    else:
+                        st.error("❌ Invalid email or password")
+                except requests.exceptions.ConnectionError:
+                    st.error(f"❌ Cannot connect to backend at {API_URL}")
+                except Exception as e:
+                    st.error(f"❌ Error: {e}")
     
     with st.expander("ℹ️ Demo Credentials"):
         st.markdown("""
@@ -77,7 +84,7 @@ def show_monitoring():
     
     try:
         headers = {"Authorization": f"Bearer {st.session_state.token}"}
-        response = requests.get(f"{API_URL}/monitoring/stats", headers=headers)
+        response = requests.get(f"{API_URL}/monitoring/stats", headers=headers, timeout=30)
         
         if response.status_code == 200:
             stats = response.json()
@@ -191,7 +198,8 @@ def show_main_app():
                     response = requests.post(
                         f"{API_URL}/ask",
                         json={"question": question},
-                        headers=headers
+                        headers=headers,
+                        timeout=60
                     )
                     
                     if response.status_code == 200:
@@ -229,6 +237,8 @@ def show_main_app():
                         st.rerun()
                     else:
                         st.error(f"Error: {response.status_code}")
+                except requests.exceptions.Timeout:
+                    st.error("Request timed out. Please try again.")
                 except Exception as e:
                     st.error(f"Error: {e}")
         else:
