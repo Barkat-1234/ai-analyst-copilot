@@ -1,0 +1,10 @@
+[
+  {
+    "timestamp": "2026-06-12T16:36:50.205103",
+    "user": "admin@company.com",
+    "question": "Show me all sales",
+    "sql": "SELECT * FROM sales s",
+    "duration_ms": 5321.19,
+    "status": 200
+  }
+]
