@@ -93,7 +93,6 @@ class APIResponse:
     @classmethod
     def from_dict(cls, data: Dict, request_id: str = None) -> 'APIResponse':
         """Parse and validate backend response"""
-        # Parse metrics
         metrics = []
         for m in data.get("metrics", []):
             metrics.append(MetricDefinition(
@@ -104,7 +103,6 @@ class APIResponse:
                 format_type=m.get("format_type", "string")
             ))
         
-        # Parse chart
         chart = None
         if data.get("chart"):
             chart = ChartDefinition(
@@ -116,7 +114,6 @@ class APIResponse:
                 color_column=data["chart"].get("color_column")
             )
         
-        # Parse formatting rules
         formatting_rules = []
         for rule in data.get("formatting_rules", []):
             formatting_rules.append(FormattingRule(
@@ -214,69 +211,57 @@ class AppState:
         st.session_state.page = "chat"
         st.rerun()
 
-# ==================== RESILIENT API CLIENT ====================
+# ==================== SIMPLE API CLIENT (FIXED) ====================
 
-class ResilientAPIClient:
-    """API client with retry, backoff, and timeout strategies"""
+class SimpleAPIClient:
+    """Simple API client that works reliably"""
     
-    def __init__(self, base_url: str, max_retries: int = 3, backoff_factor: float = 1.0):
+    def __init__(self, base_url: str):
         self.base_url = base_url
-        self.max_retries = max_retries
-        self.backoff_factor = backoff_factor
-    
-    def _request(self, method: str, endpoint: str, token: str = None, json_data: Dict = None, timeout: int = 30) -> Dict:
-        """Make request with retry logic"""
-        url = f"{self.base_url}{endpoint}"
-        headers = {"Authorization": f"Bearer {token}"} if token else {}
-        
-        last_exception = None
-        for attempt in range(self.max_retries):
-            try:
-                if method == "POST":
-                    response = requests.post(url, json=json_data, headers=headers, timeout=timeout)
-                else:
-                    response = requests.get(url, headers=headers, timeout=timeout)
-                
-                response.raise_for_status()
-                return response.json()
-                
-            except requests.exceptions.Timeout as e:
-                last_exception = e
-                wait_time = self.backoff_factor * (2 ** attempt)
-                logger.warning(f"Request timeout (attempt {attempt + 1}), retrying in {wait_time}s")
-                time.sleep(wait_time)
-            except requests.exceptions.ConnectionError as e:
-                last_exception = e
-                wait_time = self.backoff_factor * (2 ** attempt)
-                logger.warning(f"Connection error (attempt {attempt + 1}), retrying in {wait_time}s")
-                time.sleep(wait_time)
-            except requests.exceptions.HTTPError as e:
-                if e.response.status_code in [401, 403, 404]:
-                    raise
-                last_exception = e
-                wait_time = self.backoff_factor * (2 ** attempt)
-                logger.warning(f"HTTP error (attempt {attempt + 1}), retrying in {wait_time}s")
-                time.sleep(wait_time)
-        
-        raise last_exception
     
     def login(self, email: str, password: str) -> Dict:
-        return self._request("POST", "/login", json_data={"email": email, "password": password}, timeout=30)
+        """Login to get token"""
+        url = f"{self.base_url}/login"
+        response = requests.post(
+            url,
+            json={"email": email, "password": password},
+            headers={"Content-Type": "application/json"},
+            timeout=30
+        )
+        response.raise_for_status()
+        return response.json()
     
     def ask_question(self, question: str, token: str) -> Dict:
-        return self._request("POST", "/ask", token=token, json_data={"question": question}, timeout=60)
+        """Ask a question"""
+        url = f"{self.base_url}/ask"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
+        response = requests.post(
+            url,
+            json={"question": question},
+            headers=headers,
+            timeout=60
+        )
+        response.raise_for_status()
+        return response.json()
     
     def get_monitoring_stats(self, token: str) -> Dict:
-        return self._request("GET", "/monitoring/stats", token=token, timeout=30)
+        """Get monitoring stats"""
+        url = f"{self.base_url}/monitoring/stats"
+        headers = {"Authorization": f"Bearer {token}"}
+        response = requests.get(url, headers=headers, timeout=30)
+        response.raise_for_status()
+        return response.json()
 
 # ==================== PURE BACKEND-DRIVEN RENDERER ====================
 
 class BackendDrivenRenderer:
-    """Renders based SOLELY on backend configuration - ZERO local decisions"""
+    """Renders based SOLELY on backend configuration"""
     
     @staticmethod
     def render_metrics(metrics: List[MetricDefinition]) -> None:
-        """Render metrics exactly as backend defines - NO local logic"""
         if not metrics:
             return
         
@@ -288,7 +273,6 @@ class BackendDrivenRenderer:
     
     @staticmethod
     def render_chart(df: pd.DataFrame, chart: Optional[ChartDefinition]) -> None:
-        """Render chart using ONLY backend-provided definition"""
         if df.empty or not chart:
             return
         
@@ -315,11 +299,10 @@ class BackendDrivenRenderer:
                 st.plotly_chart(fig, use_container_width=True)
                 
         except Exception as e:
-            log_error(f"Chart rendering failed", {"chart": chart.__dict__, "error": str(e)[:100]})
+            log_error(f"Chart rendering failed", {"error": str(e)[:100]})
     
     @staticmethod
     def render_sql(sql_query: str, explanation: str) -> None:
-        """Render SQL section"""
         if not sql_query or sql_query == "Error generating SQL":
             return
         
@@ -334,15 +317,12 @@ class BackendDrivenRenderer:
     
     @staticmethod
     def render_table(df: pd.DataFrame, formatting_rules: List[FormattingRule]) -> None:
-        """Render data table with backend-provided formatting"""
         if df.empty:
             return
         
-        # Build formatting map
         format_map = {rule.column: rule for rule in formatting_rules}
-        
-        # Apply formatting
         display_df = df.copy()
+        
         for col in display_df.columns:
             if col in format_map:
                 rule = format_map[col]
@@ -353,10 +333,6 @@ class BackendDrivenRenderer:
                 elif rule.format_type == "integer":
                     display_df[col] = display_df[col].apply(
                         lambda x: f"{int(x):,}" if isinstance(x, (int, float)) else x
-                    )
-                elif rule.format_type == "percentage":
-                    display_df[col] = display_df[col].apply(
-                        lambda x: f"{float(x):.{rule.precision}f}%" if isinstance(x, (int, float)) else x
                     )
         
         st.dataframe(display_df, use_container_width=True)
@@ -371,7 +347,6 @@ class BackendDrivenRenderer:
     
     @staticmethod
     def render_answer(answer: str) -> None:
-        """Render answer"""
         st.success(answer)
 
 # ==================== CONFIGURATION ====================
@@ -387,35 +362,42 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# Initialize state and client
+# Initialize state and client - FIXED URL
 state = AppState()
-api_client = ResilientAPIClient("https://ai-analyst-copilot-2.onrender.com", max_retries=3, backoff_factor=1.0)
+api_client = SimpleAPIClient("https://ai-analyst-copilot-2.onrender.com")
 
 # ==================== LOGIN PAGE ====================
 def show_login():
     st.title("🔐 AI Data Analyst Copilot")
     st.markdown("### Please Login to Continue")
     
-    with st.form("login_form"):
-        email = st.text_input("Email", placeholder="admin@company.com")
-        password = st.text_input("Password", type="password", placeholder="admin123")
-        submitted = st.form_submit_button("Login", type="primary", use_container_width=True)
-        
-        if submitted:
-            if not email or not password:
-                st.error("Please enter both email and password")
-            else:
-                try:
-                    data = api_client.login(email, password)
-                    state.token = data["access_token"]
-                    state.user_email = data["user_email"]
-                    state.user_role = data["role"]
-                    st.success(f"✅ Welcome {email}!")
-                    st.rerun()
-                except requests.exceptions.ConnectionError:
-                    st.error(f"❌ Cannot connect to backend")
-                except Exception as e:
-                    log_error(f"Login failed: {str(e)[:100]}")
+    email = st.text_input("Email", placeholder="admin@company.com")
+    password = st.text_input("Password", type="password", placeholder="admin123")
+    
+    col1, col2, col3 = st.columns([1, 1, 1])
+    with col2:
+        login_clicked = st.button("Login", type="primary", use_container_width=True)
+    
+    if login_clicked:
+        if not email or not password:
+            st.error("Please enter both email and password")
+        else:
+            try:
+                data = api_client.login(email, password)
+                state.token = data["access_token"]
+                state.user_email = data["user_email"]
+                state.user_role = data["role"]
+                st.success(f"✅ Welcome {email}!")
+                st.rerun()
+            except requests.exceptions.ConnectionError:
+                st.error("❌ Cannot connect to backend. Make sure backend is running.")
+            except requests.exceptions.HTTPError as e:
+                if e.response.status_code == 401:
+                    st.error("❌ Invalid email or password")
+                else:
+                    st.error(f"❌ Login failed: {e.response.status_code}")
+            except Exception as e:
+                st.error(f"❌ Login failed: {str(e)[:100]}")
     
     with st.expander("ℹ️ Demo Credentials"):
         st.markdown("""
@@ -452,9 +434,9 @@ def show_monitoring():
         if e.response.status_code == 403:
             st.error("❌ Admin access required")
         else:
-            log_error(f"Monitoring error: {str(e)}")
+            st.error(f"Error: {str(e)[:100]}")
     except Exception as e:
-        log_error(f"Monitoring error: {str(e)[:100]}")
+        st.error(f"Error: {str(e)[:100]}")
 
 # ==================== MAIN APP ====================
 def show_main_app():
@@ -504,49 +486,62 @@ def show_main_app():
     )
 
     if st.button("🔍 Ask", type="primary") and question:
-        # Track performance
-        state.perf_tracker.start("api_call")
-        
         with st.spinner("Analyzing..."):
             try:
                 data = api_client.ask_question(question, state.token)
-                state.perf_tracker.end("api_call")
                 
-                # Validate and parse response
-                try:
-                    parsed_response = APIResponse.from_dict(data)
+                st.markdown("---")
+                st.markdown("## 💡 Answer")
+                st.success(data.get("answer", "No answer"))
+                
+                if data.get("metadata", {}).get("query_time_ms"):
+                    st.caption(f"⚡ {data['metadata']['query_time_ms']} ms")
+                
+                # Show SQL
+                if data.get("sql_used"):
+                    with st.expander("🔍 View SQL Query"):
+                        st.code(data["sql_used"], language="sql")
+                
+                # Show data
+                if data.get("data") and len(data["data"]) > 0:
+                    df = pd.DataFrame(data["data"])
                     
-                    # Render using backend-driven renderer
-                    BackendDrivenRenderer.render_answer(parsed_response.answer)
+                    # Show metrics
+                    if data.get("metrics"):
+                        cols = st.columns(min(len(data["metrics"]), 4))
+                        for idx, metric in enumerate(data["metrics"][:4]):
+                            with cols[idx]:
+                                st.metric(
+                                    label=metric.get("label", ""),
+                                    value=metric.get("value", "")
+                                )
                     
-                    if parsed_response.metadata.get("query_time_ms"):
-                        st.caption(f"⚡ {parsed_response.metadata['query_time_ms']} ms")
-                    
-                    BackendDrivenRenderer.render_sql(parsed_response.sql_used, parsed_response.sql_explanation)
-                    
-                    if parsed_response.data:
-                        df = pd.DataFrame(parsed_response.data)
-                        
-                        BackendDrivenRenderer.render_metrics(parsed_response.metrics)
-                        
-                        tab1, tab2 = st.tabs(["📊 Data", "📈 Chart"])
-                        with tab1:
-                            BackendDrivenRenderer.render_table(df, parsed_response.formatting_rules)
-                        with tab2:
-                            BackendDrivenRenderer.render_chart(df, parsed_response.chart)
+                    tab1, tab2 = st.tabs(["📊 Data Table", "📈 Chart"])
+                    with tab1:
+                        st.dataframe(df, use_container_width=True)
+                        csv = df.to_csv(index=False)
+                        st.download_button("📥 Download CSV", csv, "data.csv", "text/csv")
+                    with tab2:
+                        if data.get("chart"):
+                            chart = data["chart"]
+                            if chart.get("type") == "bar":
+                                fig = px.bar(
+                                    df, 
+                                    x=chart.get("x_column"), 
+                                    y=chart.get("y_column"),
+                                    title=chart.get("title")
+                                )
+                                st.plotly_chart(fig, use_container_width=True)
                             
-                except ValueError as e:
-                    log_error(f"API response validation failed", {"error": str(e)}, data.get("request_id"))
-                    
             except requests.exceptions.HTTPError as e:
                 if e.response.status_code == 401:
                     st.error("Session expired. Please login again.")
                     state.token = None
                     st.rerun()
                 else:
-                    log_error(f"API error: {str(e)}")
+                    st.error(f"Error: {str(e)[:100]}")
             except Exception as e:
-                log_error(f"Request failed: {str(e)[:200]}")
+                st.error(f"Error: {str(e)[:200]}")
 
 # ==================== ENTRY POINT ====================
 if state.token is None:
