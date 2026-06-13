@@ -34,6 +34,36 @@ if "page" not in st.session_state:
 # IMPORTANT: Change this to your Render backend URL
 API_URL = "https://ai-analyst-copilot-2.onrender.com"
 
+# ==================== SQL EXPLANATION FUNCTION ====================
+def explain_sql(sql_query):
+    """Generate simple explanation of SQL query in plain English"""
+    explanation = []
+    sql_lower = sql_query.lower()
+    
+    explanation.append("📖 **What this query does:**")
+    
+    if "sum(" in sql_lower:
+        explanation.append("• Calculates totals (SUM) of numeric values")
+    if "count(" in sql_lower:
+        explanation.append("• Counts the number of records")
+    if "avg(" in sql_lower:
+        explanation.append("• Calculates averages (AVG)")
+    if "group by" in sql_lower:
+        explanation.append("• Groups results by categories")
+    if "where" in sql_lower:
+        explanation.append("• Filters data based on conditions")
+    if "order by" in sql_lower:
+        explanation.append("• Sorts results (highest to lowest)")
+    if "join" in sql_lower:
+        explanation.append("• Combines data from multiple tables")
+    if "select *" in sql_lower:
+        explanation.append("• Retrieves all columns from the table")
+    
+    if len(explanation) == 1:
+        explanation.append("• Retrieves requested data from the database")
+    
+    return "\n".join(explanation)
+
 # ==================== LOGIN PAGE ====================
 def show_login():
     st.title("🔐 AI Data Analyst Copilot")
@@ -158,9 +188,9 @@ def show_main_app():
         example_questions = [
             "Show me all sales",
             "What is total revenue?",
-            "Show sales by region",
+            "Show sales by product",
             "Which product sold the most?",
-            "Total sales by product"
+            "Show me product_name, sum(revenue) from sales group by product_name"
         ]
         for q in example_questions:
             if st.button(q, key=q, use_container_width=True):
@@ -187,7 +217,7 @@ def show_main_app():
         "📝 **Ask your question:**", 
         value=st.session_state.question if st.session_state.question else "",
         height=100,
-        placeholder="Example: Show me all sales by region..."
+        placeholder="Example: Show me sales by product..."
     )
 
     if st.button("🔍 Ask", type="primary"):
@@ -213,6 +243,23 @@ def show_main_app():
                         if data.get("metadata"):
                             query_time = data["metadata"].get("query_time_ms", 0)
                             st.caption(f"⚡ Query completed in {query_time} ms")
+                        
+                        # ==================== SQL TRANSPARENCY SECTION ====================
+                        if data.get("sql_used") and data["sql_used"] != "Error generating SQL":
+                            with st.expander("🔍 View SQL Query", expanded=False):
+                                st.code(data["sql_used"], language="sql")
+                                
+                                # Copy button functionality
+                                col1, col2 = st.columns([1, 4])
+                                with col1:
+                                    if st.button("📋 Copy SQL", key="copy_sql_btn"):
+                                        st.write("✅ Copied to clipboard!")
+                                        st.code(data["sql_used"], language="sql")
+                                
+                                # SQL Explanation
+                                st.markdown("---")
+                                explanation = explain_sql(data["sql_used"])
+                                st.markdown(explanation)
                         
                         if data.get("data") and len(data["data"]) > 0:
                             df = pd.DataFrame(data["data"])
