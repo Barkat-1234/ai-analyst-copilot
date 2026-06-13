@@ -207,9 +207,9 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# FIXED: Using the correct backend URL
+# FIXED: Using the CORRECT backend URL - UPDATED!
 state = AppState()
-api_client = APIClient("https://ai-analyst-copilot-2.onrender.com")
+api_client = APIClient("https://ai-analyst-copilot-s5og.onrender.com")
 
 # ==================== LOGIN PAGE ====================
 def show_login():
