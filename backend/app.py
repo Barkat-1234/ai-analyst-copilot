@@ -345,7 +345,7 @@ SQL:"""
                     row_dict[col] = convert_value(row[i])
                 data.append(row_dict)
         
-        # Generate explanation
+        # Generate explanation with IMPROVED FORMAT
         df = pd.DataFrame(data) if data else pd.DataFrame()
         
         # Create summary statistics
@@ -360,24 +360,38 @@ SQL:"""
                     "max": float(df[col].max())
                 }
         
-        explain_prompt = f"""Question: {req.question}
+        # IMPROVED PROMPT - Structured Business Response
+        explain_prompt = f"""You are an expert Business Analyst. Analyze the data below and provide a structured business report.
 
-SQL Query Used: {sql_query}
+QUESTION: {req.question}
 
-Results Summary:
-- Total rows returned: {len(data)}
+SQL QUERY USED: {sql_query}
+
+DATA SUMMARY:
+- Total rows: {len(data)}
 - Columns: {columns}
 
-Sample Data (first 5 rows):
+SAMPLE DATA (first 5 rows):
 {data[:5] if data else 'No data'}
 
-Summary Statistics:
+STATISTICS:
 {json.dumps(summary, indent=2) if summary else 'No numeric columns found'}
 
-Please provide a brief, clear explanation of these results for a business user.
-Answer in 2-3 sentences. Be specific with numbers if relevant.
+Now provide your analysis in this EXACT format:
 
-Answer:"""
+📊 ANSWER: (1 sentence answering the question directly with key numbers)
+
+💡 INSIGHT: (1-2 sentences highlighting the most important finding. Which product/region/category performed best? Which performed worst? Include specific numbers)
+
+📈 COMPARISON: (Compare the best vs worst. Calculate ratio if possible. Example: "X is Y times higher than Z")
+
+🏢 BUSINESS INTERPRETATION: (What does this mean for the business? Which category is driving performance?)
+
+🎯 RECOMMENDATION: (1 actionable business recommendation based on the data)
+
+IMPORTANT: Use the actual numbers from the data above. Be specific. Do NOT make up numbers.
+
+Your response:"""
         
         explanation = model.generate_content(explain_prompt)
         
