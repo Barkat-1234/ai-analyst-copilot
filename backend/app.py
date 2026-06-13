@@ -23,32 +23,13 @@ from monitoring import monitor
 
 load_dotenv()
 
-# ==================== AUTHENTICATION SETUP (NO BCRYPT) ====================
+# ==================== AUTHENTICATION SETUP ====================
 
 SECRET_KEY = os.getenv("JWT_SECRET_KEY", "your-super-secret-key-change-this-in-production")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "480"))
 
 security = HTTPBearer()
-
-# Simple user database (plain passwords for development)
-USERS_DB = {
-    "admin@company.com": {
-        "email": "admin@company.com",
-        "role": "admin",
-        "password": "admin123"
-    },
-    "analyst@company.com": {
-        "email": "analyst@company.com",
-        "role": "analyst",
-        "password": "analyst123"
-    },
-    "viewer@company.com": {
-        "email": "viewer@company.com",
-        "role": "viewer",
-        "password": "viewer123"
-    }
-}
 
 # Auth Models
 class LoginRequest(BaseModel):
@@ -65,9 +46,27 @@ class TokenData(BaseModel):
     email: Optional[str] = None
     role: Optional[str] = None
 
-# Auth Functions (simple version)
+# ==================== DATABASE USER AUTHENTICATION ====================
+
+def get_user_from_db(email: str):
+    """Get user from PostgreSQL database"""
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(
+                text("SELECT email, role, password FROM users WHERE email = :email"),
+                {"email": email}
+            )
+            row = result.fetchone()
+            if row:
+                return {"email": row[0], "role": row[1], "password": row[2]}
+            return None
+    except Exception as e:
+        print(f"Database error: {e}")
+        return None
+
 def authenticate_user(email: str, password: str):
-    user = USERS_DB.get(email)
+    """Authenticate user from database"""
+    user = get_user_from_db(email)
     if user and user["password"] == password:
         return user
     return None
@@ -110,13 +109,13 @@ def require_role(required_role: str):
 
 # ==================== MAIN APP ====================
 
-# Setup Gemini
-genai.configure(api_key=os.getenv('GOOGLE_API_KEY'))
-model = genai.GenerativeModel('gemini-2.5-flash-lite')
-
 # Setup PostgreSQL
 DATABASE_URL = os.getenv('DATABASE_URL')
 engine = create_engine(DATABASE_URL, poolclass=NullPool)
+
+# Setup Gemini
+genai.configure(api_key=os.getenv('GOOGLE_API_KEY'))
+model = genai.GenerativeModel('gemini-2.5-flash-lite')
 
 app = FastAPI(title="AI Data Analyst Copilot", version="2.0.0")
 
@@ -228,7 +227,7 @@ def protected_route(current_user: TokenData = Depends(get_current_user)):
 
 @app.get("/admin-only")
 def admin_route(current_user: TokenData = Depends(require_role("admin"))):
-    return {"message": "Welcome Admin!", "users": list(USERS_DB.keys())}
+    return {"message": "Welcome Admin!"}
 
 @app.get("/me")
 def get_me(current_user: TokenData = Depends(get_current_user)):
