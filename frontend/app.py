@@ -2,14 +2,382 @@ import streamlit as st
 import requests
 import pandas as pd
 import plotly.express as px
+import json
+import logging
+import time
+import uuid
+from typing import Dict, Any, Optional, List, Union
+from datetime import datetime
+from enum import Enum
+from dataclasses import dataclass, field
+from functools import wraps
 
-st.set_page_config(
-    page_title="AI Data Analyst", 
-    layout="wide",
-    page_icon="🤖"
-)
+# ==================== LOGGING SETUP ====================
 
-# Custom CSS
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class PerformanceTracker:
+    """Track performance metrics for each request"""
+    
+    def __init__(self):
+        self.metrics = {}
+    
+    def start(self, name: str):
+        self.metrics[name] = {"start": time.time(), "end": None, "duration": None}
+    
+    def end(self, name: str):
+        if name in self.metrics:
+            self.metrics[name]["end"] = time.time()
+            self.metrics[name]["duration"] = self.metrics[name]["end"] - self.metrics[name]["start"]
+    
+    def get_duration(self, name: str) -> float:
+        return self.metrics.get(name, {}).get("duration", 0)
+
+def log_error(error_msg: str, context: Dict = None, request_id: str = None):
+    """Centralized error logging with request tracking"""
+    log_entry = {
+        "error": error_msg,
+        "context": context or {},
+        "request_id": request_id or str(uuid.uuid4()),
+        "timestamp": datetime.now().isoformat()
+    }
+    logger.error(json.dumps(log_entry))
+    st.error(f"❌ {error_msg[:200]}")
+
+# ==================== STRICT DATA MODELS (BACKEND-DRIVEN) ====================
+
+@dataclass
+class MetricDefinition:
+    """Fully typed metric from backend"""
+    key: str
+    label: str
+    value: str
+    icon: str
+    format_type: str
+    severity: Optional[str] = None
+
+@dataclass
+class ChartDefinition:
+    """Fully typed chart definition from backend"""
+    type: str
+    x_column: str
+    y_column: str
+    title: str
+    format_type: Optional[str] = None
+    color_column: Optional[str] = None
+
+@dataclass
+class FormattingRule:
+    """Column formatting rule from backend"""
+    column: str
+    format_type: str
+    precision: int = 2
+
+@dataclass
+class APIResponse:
+    """Strict backend response schema"""
+    success: bool
+    answer: str
+    sql_used: str
+    sql_explanation: str
+    data: List[Dict[str, Any]]
+    metrics: List[MetricDefinition]
+    chart: Optional[ChartDefinition]
+    formatting_rules: List[FormattingRule]
+    metadata: Dict[str, Any]
+    error: Optional[str] = None
+    request_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    api_version: str = "3.0.0"
+    
+    @classmethod
+    def from_dict(cls, data: Dict, request_id: str = None) -> 'APIResponse':
+        """Parse and validate backend response"""
+        # Parse metrics
+        metrics = []
+        for m in data.get("metrics", []):
+            metrics.append(MetricDefinition(
+                key=m.get("key", ""),
+                label=m.get("label", ""),
+                value=m.get("value", ""),
+                icon=m.get("icon", ""),
+                format_type=m.get("format_type", "string")
+            ))
+        
+        # Parse chart
+        chart = None
+        if data.get("chart"):
+            chart = ChartDefinition(
+                type=data["chart"].get("type", "bar"),
+                x_column=data["chart"].get("x_column", ""),
+                y_column=data["chart"].get("y_column", ""),
+                title=data["chart"].get("title", ""),
+                format_type=data["chart"].get("format_type"),
+                color_column=data["chart"].get("color_column")
+            )
+        
+        # Parse formatting rules
+        formatting_rules = []
+        for rule in data.get("formatting_rules", []):
+            formatting_rules.append(FormattingRule(
+                column=rule.get("column", ""),
+                format_type=rule.get("format_type", "raw"),
+                precision=rule.get("precision", 2)
+            ))
+        
+        return cls(
+            success=data.get("success", True),
+            answer=data.get("answer", ""),
+            sql_used=data.get("sql_used", ""),
+            sql_explanation=data.get("sql_explanation", ""),
+            data=data.get("data", []),
+            metrics=metrics,
+            chart=chart,
+            formatting_rules=formatting_rules,
+            metadata=data.get("metadata", {}),
+            error=data.get("error"),
+            request_id=request_id or data.get("request_id", str(uuid.uuid4())),
+            api_version=data.get("api_version", "3.0.0")
+        )
+
+# ==================== CENTRAL STATE MANAGEMENT ====================
+
+class AppState:
+    """Centralized state management wrapper"""
+    
+    def __init__(self):
+        self._init_session_state()
+    
+    def _init_session_state(self):
+        if "token" not in st.session_state:
+            st.session_state.token = None
+        if "user_email" not in st.session_state:
+            st.session_state.user_email = None
+        if "user_role" not in st.session_state:
+            st.session_state.user_role = None
+        if "question" not in st.session_state:
+            st.session_state.question = ""
+        if "page" not in st.session_state:
+            st.session_state.page = "chat"
+        if "perf_tracker" not in st.session_state:
+            st.session_state.perf_tracker = PerformanceTracker()
+    
+    @property
+    def token(self) -> Optional[str]:
+        return st.session_state.token
+    
+    @token.setter
+    def token(self, value: Optional[str]):
+        st.session_state.token = value
+    
+    @property
+    def user_email(self) -> Optional[str]:
+        return st.session_state.user_email
+    
+    @user_email.setter
+    def user_email(self, value: Optional[str]):
+        st.session_state.user_email = value
+    
+    @property
+    def user_role(self) -> Optional[str]:
+        return st.session_state.user_role
+    
+    @user_role.setter
+    def user_role(self, value: Optional[str]):
+        st.session_state.user_role = value
+    
+    @property
+    def question(self) -> str:
+        return st.session_state.question
+    
+    @question.setter
+    def question(self, value: str):
+        st.session_state.question = value
+    
+    @property
+    def page(self) -> str:
+        return st.session_state.page
+    
+    @page.setter
+    def page(self, value: str):
+        st.session_state.page = value
+    
+    @property
+    def perf_tracker(self) -> PerformanceTracker:
+        return st.session_state.perf_tracker
+    
+    def logout(self):
+        st.session_state.token = None
+        st.session_state.user_email = None
+        st.session_state.user_role = None
+        st.session_state.question = ""
+        st.session_state.page = "chat"
+        st.rerun()
+
+# ==================== RESILIENT API CLIENT ====================
+
+class ResilientAPIClient:
+    """API client with retry, backoff, and timeout strategies"""
+    
+    def __init__(self, base_url: str, max_retries: int = 3, backoff_factor: float = 1.0):
+        self.base_url = base_url
+        self.max_retries = max_retries
+        self.backoff_factor = backoff_factor
+    
+    def _request(self, method: str, endpoint: str, token: str = None, json_data: Dict = None, timeout: int = 30) -> Dict:
+        """Make request with retry logic"""
+        url = f"{self.base_url}{endpoint}"
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        
+        last_exception = None
+        for attempt in range(self.max_retries):
+            try:
+                if method == "POST":
+                    response = requests.post(url, json=json_data, headers=headers, timeout=timeout)
+                else:
+                    response = requests.get(url, headers=headers, timeout=timeout)
+                
+                response.raise_for_status()
+                return response.json()
+                
+            except requests.exceptions.Timeout as e:
+                last_exception = e
+                wait_time = self.backoff_factor * (2 ** attempt)
+                logger.warning(f"Request timeout (attempt {attempt + 1}), retrying in {wait_time}s")
+                time.sleep(wait_time)
+            except requests.exceptions.ConnectionError as e:
+                last_exception = e
+                wait_time = self.backoff_factor * (2 ** attempt)
+                logger.warning(f"Connection error (attempt {attempt + 1}), retrying in {wait_time}s")
+                time.sleep(wait_time)
+            except requests.exceptions.HTTPError as e:
+                if e.response.status_code in [401, 403, 404]:
+                    raise
+                last_exception = e
+                wait_time = self.backoff_factor * (2 ** attempt)
+                logger.warning(f"HTTP error (attempt {attempt + 1}), retrying in {wait_time}s")
+                time.sleep(wait_time)
+        
+        raise last_exception
+    
+    def login(self, email: str, password: str) -> Dict:
+        return self._request("POST", "/login", json_data={"email": email, "password": password}, timeout=30)
+    
+    def ask_question(self, question: str, token: str) -> Dict:
+        return self._request("POST", "/ask", token=token, json_data={"question": question}, timeout=60)
+    
+    def get_monitoring_stats(self, token: str) -> Dict:
+        return self._request("GET", "/monitoring/stats", token=token, timeout=30)
+
+# ==================== PURE BACKEND-DRIVEN RENDERER ====================
+
+class BackendDrivenRenderer:
+    """Renders based SOLELY on backend configuration - ZERO local decisions"""
+    
+    @staticmethod
+    def render_metrics(metrics: List[MetricDefinition]) -> None:
+        """Render metrics exactly as backend defines - NO local logic"""
+        if not metrics:
+            return
+        
+        cols = st.columns(min(len(metrics), 4))
+        for idx, metric in enumerate(metrics[:4]):
+            with cols[idx]:
+                display_label = f"{metric.icon} {metric.label}" if metric.icon else metric.label
+                st.metric(label=display_label, value=metric.value)
+    
+    @staticmethod
+    def render_chart(df: pd.DataFrame, chart: Optional[ChartDefinition]) -> None:
+        """Render chart using ONLY backend-provided definition"""
+        if df.empty or not chart:
+            return
+        
+        if chart.x_column not in df.columns or chart.y_column not in df.columns:
+            return
+        
+        try:
+            if chart.type == "bar":
+                fig = px.bar(
+                    df, x=chart.x_column, y=chart.y_column,
+                    title=chart.title, color=chart.color_column, text_auto=True
+                )
+                if chart.format_type == "currency":
+                    fig.update_traces(texttemplate='%{y:$,.2f}', textposition='outside')
+                fig.update_layout(height=500, bargap=0.3)
+                st.plotly_chart(fig, use_container_width=True)
+                
+            elif chart.type == "line":
+                fig = px.line(
+                    df, x=chart.x_column, y=chart.y_column,
+                    title=chart.title, color=chart.color_column, markers=True
+                )
+                fig.update_layout(height=500)
+                st.plotly_chart(fig, use_container_width=True)
+                
+        except Exception as e:
+            log_error(f"Chart rendering failed", {"chart": chart.__dict__, "error": str(e)[:100]})
+    
+    @staticmethod
+    def render_sql(sql_query: str, explanation: str) -> None:
+        """Render SQL section"""
+        if not sql_query or sql_query == "Error generating SQL":
+            return
+        
+        with st.expander("🔍 View SQL Query", expanded=False):
+            st.code(sql_query, language="sql")
+            if st.button("📋 Copy SQL", key="copy_sql_btn"):
+                st.success("✅ SQL ready to copy")
+            if explanation:
+                st.markdown("---")
+                st.markdown("### 📖 Query Explanation")
+                st.markdown(explanation)
+    
+    @staticmethod
+    def render_table(df: pd.DataFrame, formatting_rules: List[FormattingRule]) -> None:
+        """Render data table with backend-provided formatting"""
+        if df.empty:
+            return
+        
+        # Build formatting map
+        format_map = {rule.column: rule for rule in formatting_rules}
+        
+        # Apply formatting
+        display_df = df.copy()
+        for col in display_df.columns:
+            if col in format_map:
+                rule = format_map[col]
+                if rule.format_type == "currency":
+                    display_df[col] = display_df[col].apply(
+                        lambda x: f"${x:,.{rule.precision}f}" if isinstance(x, (int, float)) else x
+                    )
+                elif rule.format_type == "integer":
+                    display_df[col] = display_df[col].apply(
+                        lambda x: f"{int(x):,}" if isinstance(x, (int, float)) else x
+                    )
+                elif rule.format_type == "percentage":
+                    display_df[col] = display_df[col].apply(
+                        lambda x: f"{float(x):.{rule.precision}f}%" if isinstance(x, (int, float)) else x
+                    )
+        
+        st.dataframe(display_df, use_container_width=True)
+        
+        csv = df.to_csv(index=False)
+        st.download_button(
+            label="📥 Download CSV",
+            data=csv,
+            file_name=f"export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            mime="text/csv"
+        )
+    
+    @staticmethod
+    def render_answer(answer: str) -> None:
+        """Render answer"""
+        st.success(answer)
+
+# ==================== CONFIGURATION ====================
+
+st.set_page_config(page_title="AI Data Analyst", layout="wide", page_icon="🤖")
+
 st.markdown("""
     <style>
         footer {visibility: hidden;}
@@ -19,50 +387,9 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# Initialize session state
-if "token" not in st.session_state:
-    st.session_state.token = None
-if "user_email" not in st.session_state:
-    st.session_state.user_email = None
-if "user_role" not in st.session_state:
-    st.session_state.user_role = None
-if "question" not in st.session_state:
-    st.session_state.question = ""
-if "page" not in st.session_state:
-    st.session_state.page = "chat"
-
-# IMPORTANT: Change this to your Render backend URL
-API_URL = "https://ai-analyst-copilot-2.onrender.com"
-
-# ==================== SQL EXPLANATION FUNCTION ====================
-def explain_sql(sql_query):
-    """Generate simple explanation of SQL query in plain English"""
-    explanation = []
-    sql_lower = sql_query.lower()
-    
-    explanation.append("📖 **What this query does:**")
-    
-    if "sum(" in sql_lower:
-        explanation.append("• Calculates totals (SUM) of numeric values")
-    if "count(" in sql_lower:
-        explanation.append("• Counts the number of records")
-    if "avg(" in sql_lower:
-        explanation.append("• Calculates averages (AVG)")
-    if "group by" in sql_lower:
-        explanation.append("• Groups results by categories")
-    if "where" in sql_lower:
-        explanation.append("• Filters data based on conditions")
-    if "order by" in sql_lower:
-        explanation.append("• Sorts results (highest to lowest)")
-    if "join" in sql_lower:
-        explanation.append("• Combines data from multiple tables")
-    if "select *" in sql_lower:
-        explanation.append("• Retrieves all columns from the table")
-    
-    if len(explanation) == 1:
-        explanation.append("• Retrieves requested data from the database")
-    
-    return "\n".join(explanation)
+# Initialize state and client
+state = AppState()
+api_client = ResilientAPIClient("https://ai-analyst-copilot-2.onrender.com", max_retries=3, backoff_factor=1.0)
 
 # ==================== LOGIN PAGE ====================
 def show_login():
@@ -79,24 +406,16 @@ def show_login():
                 st.error("Please enter both email and password")
             else:
                 try:
-                    response = requests.post(
-                        f"{API_URL}/login",
-                        json={"email": email, "password": password},
-                        timeout=30
-                    )
-                    if response.status_code == 200:
-                        data = response.json()
-                        st.session_state.token = data["access_token"]
-                        st.session_state.user_email = data["user_email"]
-                        st.session_state.user_role = data["role"]
-                        st.success(f"✅ Welcome {email}!")
-                        st.rerun()
-                    else:
-                        st.error("❌ Invalid email or password")
+                    data = api_client.login(email, password)
+                    state.token = data["access_token"]
+                    state.user_email = data["user_email"]
+                    state.user_role = data["role"]
+                    st.success(f"✅ Welcome {email}!")
+                    st.rerun()
                 except requests.exceptions.ConnectionError:
-                    st.error(f"❌ Cannot connect to backend at {API_URL}")
+                    st.error(f"❌ Cannot connect to backend")
                 except Exception as e:
-                    st.error(f"❌ Error: {e}")
+                    log_error(f"Login failed: {str(e)[:100]}")
     
     with st.expander("ℹ️ Demo Credentials"):
         st.markdown("""
@@ -110,102 +429,66 @@ def show_login():
 # ==================== MONITORING PAGE ====================
 def show_monitoring():
     st.title("📊 System Monitoring Dashboard")
-    st.markdown("*Real-time system statistics*")
-    
-    try:
-        headers = {"Authorization": f"Bearer {st.session_state.token}"}
-        response = requests.get(f"{API_URL}/monitoring/stats", headers=headers, timeout=30)
-        
-        if response.status_code == 200:
-            stats = response.json()
-            
-            # Display metrics in cards
-            col1, col2, col3, col4 = st.columns(4)
-            
-            with col1:
-                st.metric("Total Requests", stats.get("total_requests", 0))
-            with col2:
-                st.metric("Avg Response Time", f"{stats.get('avg_response_time_ms', 0)} ms")
-            with col3:
-                st.metric("Error Rate", f"{stats.get('error_rate', 0)}%")
-            with col4:
-                st.metric("Status", stats.get("status", "unknown").upper())
-            
-            # Top questions
-            if stats.get("top_questions"):
-                st.markdown("---")
-                st.subheader("🔥 Most Asked Questions")
-                top_df = pd.DataFrame(stats["top_questions"], columns=["Question", "Count"])
-                st.dataframe(top_df, use_container_width=True)
-            
-            # System health
-            st.markdown("---")
-            st.subheader("🩺 System Health")
-            if stats.get("status") == "healthy":
-                st.success("All systems operational")
-            else:
-                st.warning("System issues detected")
-                
-        elif response.status_code == 403:
-            st.error("❌ You don't have permission to view monitoring (Admin only)")
-        else:
-            st.error(f"Error: {response.status_code}")
-            
-    except Exception as e:
-        st.error(f"Error fetching monitoring data: {e}")
     
     if st.button("← Back to Chat", use_container_width=True):
-        st.session_state.page = "chat"
+        state.page = "chat"
         st.rerun()
+        return
+    
+    try:
+        stats = api_client.get_monitoring_stats(state.token)
+        
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Total Requests", stats.get("total_requests", 0))
+        with col2:
+            st.metric("Avg Response Time", f"{stats.get('avg_response_time_ms', 0)} ms")
+        with col3:
+            st.metric("Error Rate", f"{stats.get('error_rate', 0)}%")
+        with col4:
+            st.metric("Status", stats.get("status", "unknown").upper())
+            
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 403:
+            st.error("❌ Admin access required")
+        else:
+            log_error(f"Monitoring error: {str(e)}")
+    except Exception as e:
+        log_error(f"Monitoring error: {str(e)[:100]}")
 
 # ==================== MAIN APP ====================
 def show_main_app():
     # Sidebar
     with st.sidebar:
-        st.markdown(f"### 👤 {st.session_state.user_email}")
-        st.markdown(f"**Role:** `{st.session_state.user_role}`")
+        st.markdown(f"### 👤 {state.user_email}")
+        st.markdown(f"**Role:** `{state.user_role}`")
         st.markdown("---")
         
-        # Navigation
-        st.markdown("### 🧭 Navigation")
         if st.button("💬 Chat", use_container_width=True):
-            st.session_state.page = "chat"
+            state.page = "chat"
             st.rerun()
         
         if st.button("📊 Monitoring", use_container_width=True):
-            st.session_state.page = "monitoring"
+            state.page = "monitoring"
             st.rerun()
         
         st.markdown("---")
         
         if st.button("🚪 Logout", use_container_width=True):
-            for key in ["token", "user_email", "user_role", "question", "page"]:
-                st.session_state[key] = None if key != "page" else "chat"
-            st.rerun()
+            state.logout()
         
         st.markdown("---")
         st.markdown("### 💡 Example Questions")
-        example_questions = [
-            "Show me all sales",
-            "What is total revenue?",
-            "Show sales by product",
-            "Which product sold the most?",
-            "Show me product_name, sum(revenue) from sales group by product_name"
-        ]
-        for q in example_questions:
+        for q in ["Show me all sales", "What is total revenue?", "Show sales by product"]:
             if st.button(q, key=q, use_container_width=True):
-                st.session_state.question = q
-                st.session_state.page = "chat"
+                state.question = q
+                state.page = "chat"
                 st.rerun()
         
         st.markdown("---")
-        st.markdown("### 📊 Database Info")
-        st.info("✅ PostgreSQL Connected")
-        st.info("✅ Gemini AI Ready")
-        st.info("✅ RAG System Active")
+        st.info("✅ PostgreSQL Connected\n✅ Gemini AI Ready")
 
-    # Page routing
-    if st.session_state.get("page") == "monitoring":
+    if state.page == "monitoring":
         show_monitoring()
         return
     
@@ -215,84 +498,58 @@ def show_main_app():
 
     question = st.text_area(
         "📝 **Ask your question:**", 
-        value=st.session_state.question if st.session_state.question else "",
+        value=state.question or "",
         height=100,
         placeholder="Example: Show me sales by product..."
     )
 
-    if st.button("🔍 Ask", type="primary"):
-        if question:
-            with st.spinner("🧠 Analyzing..."):
+    if st.button("🔍 Ask", type="primary") and question:
+        # Track performance
+        state.perf_tracker.start("api_call")
+        
+        with st.spinner("Analyzing..."):
+            try:
+                data = api_client.ask_question(question, state.token)
+                state.perf_tracker.end("api_call")
+                
+                # Validate and parse response
                 try:
-                    headers = {"Authorization": f"Bearer {st.session_state.token}"}
-                    response = requests.post(
-                        f"{API_URL}/ask",
-                        json={"question": question},
-                        headers=headers,
-                        timeout=60
-                    )
+                    parsed_response = APIResponse.from_dict(data)
                     
-                    if response.status_code == 200:
-                        data = response.json()
+                    # Render using backend-driven renderer
+                    BackendDrivenRenderer.render_answer(parsed_response.answer)
+                    
+                    if parsed_response.metadata.get("query_time_ms"):
+                        st.caption(f"⚡ {parsed_response.metadata['query_time_ms']} ms")
+                    
+                    BackendDrivenRenderer.render_sql(parsed_response.sql_used, parsed_response.sql_explanation)
+                    
+                    if parsed_response.data:
+                        df = pd.DataFrame(parsed_response.data)
                         
-                        st.markdown("---")
-                        st.markdown("## 💡 Answer")
-                        st.success(data["answer"])
+                        BackendDrivenRenderer.render_metrics(parsed_response.metrics)
                         
-                        # Show query time in metadata
-                        if data.get("metadata"):
-                            query_time = data["metadata"].get("query_time_ms", 0)
-                            st.caption(f"⚡ Query completed in {query_time} ms")
-                        
-                        # ==================== SQL TRANSPARENCY SECTION ====================
-                        if data.get("sql_used") and data["sql_used"] != "Error generating SQL":
-                            with st.expander("🔍 View SQL Query", expanded=False):
-                                st.code(data["sql_used"], language="sql")
-                                
-                                # Copy button functionality
-                                col1, col2 = st.columns([1, 4])
-                                with col1:
-                                    if st.button("📋 Copy SQL", key="copy_sql_btn"):
-                                        st.write("✅ Copied to clipboard!")
-                                        st.code(data["sql_used"], language="sql")
-                                
-                                # SQL Explanation
-                                st.markdown("---")
-                                explanation = explain_sql(data["sql_used"])
-                                st.markdown(explanation)
-                        
-                        if data.get("data") and len(data["data"]) > 0:
-                            df = pd.DataFrame(data["data"])
+                        tab1, tab2 = st.tabs(["📊 Data", "📈 Chart"])
+                        with tab1:
+                            BackendDrivenRenderer.render_table(df, parsed_response.formatting_rules)
+                        with tab2:
+                            BackendDrivenRenderer.render_chart(df, parsed_response.chart)
                             
-                            tab1, tab2 = st.tabs(["📊 Data Table", "📈 Bar Chart"])
-                            
-                            with tab1:
-                                st.dataframe(df, use_container_width=True)
-                                csv = df.to_csv(index=False)
-                                st.download_button("📥 Download CSV", csv, "data.csv", "text/csv")
-                            
-                            with tab2:
-                                numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
-                                if numeric_cols:
-                                    y_col = numeric_cols[0]
-                                    x_col = df.columns[0]
-                                    fig = px.bar(df, x=x_col, y=y_col, title=f"{y_col} by {x_col}")
-                                    st.plotly_chart(fig, use_container_width=True)
-                    elif response.status_code == 401:
-                        st.error("Session expired. Please login again.")
-                        st.session_state.token = None
-                        st.rerun()
-                    else:
-                        st.error(f"Error: {response.status_code}")
-                except requests.exceptions.Timeout:
-                    st.error("Request timed out. Please try again.")
-                except Exception as e:
-                    st.error(f"Error: {e}")
-        else:
-            st.warning("Please enter a question")
+                except ValueError as e:
+                    log_error(f"API response validation failed", {"error": str(e)}, data.get("request_id"))
+                    
+            except requests.exceptions.HTTPError as e:
+                if e.response.status_code == 401:
+                    st.error("Session expired. Please login again.")
+                    state.token = None
+                    st.rerun()
+                else:
+                    log_error(f"API error: {str(e)}")
+            except Exception as e:
+                log_error(f"Request failed: {str(e)[:200]}")
 
-# ==================== MAIN ====================
-if st.session_state.token is None:
+# ==================== ENTRY POINT ====================
+if state.token is None:
     show_login()
 else:
     show_main_app()
