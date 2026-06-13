@@ -2,36 +2,406 @@ import os
 import re
 import google.generativeai as genai
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi import FastAPI, HTTPException, Depends, status, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from pydantic import BaseModel, Field
 import uvicorn
 from sqlalchemy import create_engine, text, inspect
-from sqlalchemy.pool import NullPool
+from sqlalchemy.pool import QueuePool
+from sqlalchemy.exc import SQLAlchemyError
 import pandas as pd
 from decimal import Decimal
 import json
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 import time
 import hashlib
 from datetime import datetime, timedelta
 from jose import JWTError, jwt
-
-# Import monitoring
-from monitoring import monitor
+import uuid
+import asyncio
+import sqlglot
+from sqlglot import parse_one, errors
+from functools import lru_cache
+from contextlib import contextmanager
+import redis
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 load_dotenv()
 
-# ==================== AUTHENTICATION SETUP ====================
+# ==================== CONFIGURATION ====================
 
 SECRET_KEY = os.getenv("JWT_SECRET_KEY", "your-super-secret-key-change-this-in-production")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "480"))
 
+# Security Configuration
+MAX_QUERY_TIMEOUT_SECONDS = 30
+MAX_ROWS_RETURN = 1000
+MAX_ROWS_LIMIT = 500
+FORBIDDEN_SQL_KEYWORDS = ['DROP', 'DELETE', 'UPDATE', 'INSERT', 'ALTER', 'CREATE', 'TRUNCATE', 'GRANT', 'REVOKE', 'MERGE', 'REPLACE']
+
+# Rate Limiting
+RATE_LIMIT = "20/minute"
+RATE_LIMIT_ADMIN = "100/minute"
+
+# Cache Configuration
+SCHEMA_CACHE_TTL = 3600  # 1 hour
+QUERY_CACHE_MAX_SIZE = 100
+QUERY_CACHE_TTL = 300  # 5 minutes
+
+# Redis (optional - fallback to memory if not available)
+REDIS_URL = os.getenv("REDIS_URL", None)
+try:
+    if REDIS_URL:
+        redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+        redis_available = True
+    else:
+        redis_available = False
+except:
+    redis_available = False
+
+# PostgreSQL Setup with Connection Pooling
+DATABASE_URL = os.getenv('DATABASE_URL')
+engine = create_engine(
+    DATABASE_URL, 
+    poolclass=QueuePool,
+    pool_size=10,
+    max_overflow=20,
+    pool_pre_ping=True,
+    pool_recycle=3600
+)
+
+# Gemini Setup
+genai.configure(api_key=os.getenv('GOOGLE_API_KEY'))
+model = genai.GenerativeModel('gemini-2.5-flash-lite')
+
+# ==================== RATE LIMITING ====================
+
+limiter = Limiter(key_func=get_remote_address)
+app = FastAPI(title="AI Data Analyst Copilot", version="4.0.0")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# ==================== MIDDLEWARE ====================
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=os.getenv("ALLOWED_ORIGINS", "*").split(","),
+    allow_credentials=True,
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
+
+app.add_middleware(
+    TrustedHostMiddleware,
+    allowed_hosts=os.getenv("ALLOWED_HOSTS", "*").split(",")
+)
+
+# ==================== SQL AST VALIDATION (sqlglot) ====================
+
+def validate_sql_ast(sql_query: str) -> Tuple[bool, str]:
+    """Use sqlglot to validate SQL syntax and structure"""
+    try:
+        parsed = parse_one(sql_query, dialect="postgres")
+        
+        # Check if it's a SELECT statement
+        if parsed.keywords and parsed.keywords[0].upper() != 'SELECT':
+            return False, "Only SELECT statements are allowed"
+        
+        # Extract limit to enforce caps
+        limit = None
+        for node in parsed.walk():
+            if hasattr(node, 'args') and 'limit' in node.args:
+                limit = node.args['limit']
+                break
+        
+        return True, "Valid SQL"
+    except errors.ParseError as e:
+        return False, f"SQL syntax error: {str(e)}"
+
+def enforce_limit(sql_query: str) -> str:
+    """Enforce row limit on SQL queries"""
+    sql_upper = sql_query.upper()
+    
+    # Check if LIMIT already exists
+    if 'LIMIT' in sql_upper:
+        # Replace existing limit if it's too high
+        import re
+        pattern = r'LIMIT\s+(\d+)'
+        match = re.search(pattern, sql_upper, re.IGNORECASE)
+        if match:
+            current_limit = int(match.group(1))
+            if current_limit > MAX_ROWS_LIMIT:
+                sql_query = re.sub(pattern, f'LIMIT {MAX_ROWS_LIMIT}', sql_query, flags=re.IGNORECASE)
+    else:
+        # Add limit
+        sql_query = f"{sql_query} LIMIT {MAX_ROWS_LIMIT}"
+    
+    return sql_query
+
+def validate_sql_readonly(sql_query: str) -> Tuple[bool, str]:
+    """Validate SQL is read-only (no destructive operations)"""
+    sql_upper = sql_query.upper()
+    
+    for keyword in FORBIDDEN_SQL_KEYWORDS:
+        if re.search(rf'\b{keyword}\b', sql_upper):
+            return False, f"SQL contains forbidden keyword: {keyword}"
+    
+    return True, "OK"
+
+def validate_query_timeout(start_time: float) -> bool:
+    """Check if query has exceeded timeout"""
+    elapsed = time.time() - start_time
+    if elapsed > MAX_QUERY_TIMEOUT_SECONDS:
+        return False
+    return True
+
+# ==================== SANITIZED ERROR RESPONSES ====================
+
+def sanitize_error_response(error: Exception, user_role: str) -> Dict[str, Any]:
+    """Return sanitized error messages (no internal details to non-admins)"""
+    error_type = type(error).__name__
+    
+    if user_role == "admin":
+        return {
+            "error_type": error_type,
+            "message": str(error)[:200]
+        }
+    else:
+        # Generic message for non-admins
+        if "syntax" in str(error).lower():
+            return {
+                "error_type": "QueryError",
+                "message": "There was an issue processing your query. Please rephrase your question."
+            }
+        elif "permission" in str(error).lower() or "forbidden" in str(error).lower():
+            return {
+                "error_type": "PermissionError",
+                "message": "You don't have permission to perform this action."
+            }
+        else:
+            return {
+                "error_type": "InternalError",
+                "message": "An unexpected error occurred. Please try again later."
+            }
+
+# ==================== PROMPT HARDENING ====================
+
+SYSTEM_PROMPT = """
+You are an AI Data Analyst for a PostgreSQL database. Follow these rules STRICTLY:
+
+RULES:
+1. Generate ONLY SELECT queries
+2. DO NOT use DROP, DELETE, UPDATE, INSERT, ALTER, CREATE
+3. DO NOT make up tables or columns
+4. Use ONLY the schema provided
+5. If the question cannot be answered with available schema, respond with "UNABLE_TO_ANSWER"
+6. Keep queries simple and efficient
+7. Always add LIMIT clause
+"""
+
+def get_sql_prompt(schema_text: str, question: str) -> str:
+    """Get hardened SQL prompt"""
+    return f"""{SYSTEM_PROMPT}
+
+DATABASE SCHEMA:
+{schema_text}
+
+USER QUESTION: {question}
+
+Generate ONLY the SQL query:"""
+
+# ==================== CACHE MANAGEMENT ====================
+
+class PerUserCache:
+    """Cache isolated per user with schema version tracking"""
+    
+    def __init__(self, max_size: int = QUERY_CACHE_MAX_SIZE, ttl_seconds: int = QUERY_CACHE_TTL):
+        self.max_size = max_size
+        self.ttl = ttl_seconds
+        self._cache: Dict[str, Dict] = {}
+        self._schema_hash = None
+    
+    def update_schema_hash(self, schema_hash: str):
+        """Update schema hash to invalidate cache when schema changes"""
+        self._schema_hash = schema_hash
+        self._cache.clear()
+    
+    def _get_user_key(self, user_email: str, question: str, schema_hash: str) -> str:
+        return hashlib.md5(f"{user_email}:{question.lower().strip()}:{schema_hash}".encode()).hexdigest()
+    
+    def get(self, user_email: str, question: str, schema_hash: str) -> Optional[Dict]:
+        key = self._get_user_key(user_email, question, schema_hash)
+        if key in self._cache:
+            entry = self._cache[key]
+            if time.time() - entry['timestamp'] < self.ttl:
+                return entry['data']
+            else:
+                del self._cache[key]
+        return None
+    
+    def set(self, user_email: str, question: str, schema_hash: str, data: Dict) -> None:
+        key = self._get_user_key(user_email, question, schema_hash)
+        
+        if len(self._cache) >= self.max_size:
+            oldest_key = min(self._cache.keys(), key=lambda k: self._cache[k]['timestamp'])
+            del self._cache[oldest_key]
+        
+        self._cache[key] = {
+            'data': data,
+            'timestamp': time.time(),
+            'user': user_email
+        }
+
+# Initialize cache
+query_cache = PerUserCache()
+
+# ==================== SCHEMA CACHING WITH HASH ====================
+
+_schema_cache = None
+_schema_cache_time = 0
+_schema_hash = None
+
+def get_schema_hash(schema: Dict[str, Any]) -> str:
+    """Generate hash of schema for cache invalidation"""
+    schema_str = json.dumps(schema, sort_keys=True)
+    return hashlib.md5(schema_str.encode()).hexdigest()
+
+def get_schema_info_cached() -> Tuple[Dict[str, Any], str]:
+    """Get cached database schema with hash"""
+    global _schema_cache, _schema_cache_time, _schema_hash
+    
+    current_time = time.time()
+    if _schema_cache is None or (current_time - _schema_cache_time) > SCHEMA_CACHE_TTL:
+        inspector = inspect(engine)
+        schema = {}
+        for table_name in inspector.get_table_names():
+            columns = []
+            for col in inspector.get_columns(table_name):
+                columns.append({
+                    "name": col['name'],
+                    "type": str(col['type']),
+                    "nullable": col['nullable']
+                })
+            schema[table_name] = columns
+        _schema_cache = schema
+        _schema_cache_time = current_time
+        _schema_hash = get_schema_hash(schema)
+        query_cache.update_schema_hash(_schema_hash)
+    
+    return _schema_cache, _schema_hash
+
+def format_schema_for_prompt(schema: Dict[str, Any]) -> str:
+    result = ""
+    for table, columns in schema.items():
+        result += f"\nTable: {table}\nColumns:\n"
+        for col in columns:
+            result += f"  - {col['name']} ({col['type']})"
+            if not col['nullable']:
+                result += " NOT NULL"
+            result += "\n"
+    return result
+
+# ==================== QUERY COST ESTIMATOR ====================
+
+def estimate_query_cost(sql_query: str) -> Dict[str, Any]:
+    """Estimate query complexity cost"""
+    sql_lower = sql_query.lower()
+    
+    cost = {
+        "complexity": "low",
+        "score": 1,
+        "estimated_time_ms": 100,
+        "warnings": []
+    }
+    
+    # Check for expensive operations
+    if "join" in sql_lower:
+        cost["score"] += 2
+        cost["warnings"].append("Query uses JOIN operations")
+    
+    if "group by" in sql_lower:
+        cost["score"] += 2
+        cost["warnings"].append("Query uses GROUP BY")
+    
+    if "order by" in sql_lower:
+        cost["score"] += 1
+    
+    if "distinct" in sql_lower:
+        cost["score"] += 1
+    
+    if "where" in sql_lower:
+        cost["score"] += 1
+    
+    # Determine complexity level
+    if cost["score"] <= 3:
+        cost["complexity"] = "low"
+        cost["estimated_time_ms"] = 100
+    elif cost["score"] <= 6:
+        cost["complexity"] = "medium"
+        cost["estimated_time_ms"] = 500
+    else:
+        cost["complexity"] = "high"
+        cost["estimated_time_ms"] = 2000
+    
+    return cost
+
+# ==================== ASYNC DB + GEMINI ====================
+
+async def async_generate_content(prompt: str) -> str:
+    """Async wrapper for Gemini API"""
+    loop = asyncio.get_event_loop()
+    response = await loop.run_in_executor(None, model.generate_content, prompt)
+    return response.text
+
+async def async_execute_sql(sql_query: str) -> Tuple[List, List]:
+    """Async wrapper for SQL execution"""
+    loop = asyncio.get_event_loop()
+    
+    def execute():
+        with engine.connect() as conn:
+            result = conn.execute(text(sql_query))
+            return result.fetchall(), list(result.keys())
+    
+    return await loop.run_in_executor(None, execute)
+
+# ==================== OBSERVABILITY METRICS ====================
+
+class MetricsCollector:
+    """Separate metrics for LLM vs DB performance"""
+    
+    def __init__(self):
+        self.llm_total_time = 0
+        self.db_total_time = 0
+        self.llm_calls = 0
+        self.db_calls = 0
+    
+    def record_llm(self, duration_ms: float):
+        self.llm_total_time += duration_ms
+        self.llm_calls += 1
+    
+    def record_db(self, duration_ms: float):
+        self.db_total_time += duration_ms
+        self.db_calls += 1
+    
+    def get_stats(self):
+        return {
+            "llm_avg_ms": round(self.llm_total_time / self.llm_calls, 2) if self.llm_calls else 0,
+            "db_avg_ms": round(self.db_total_time / self.db_calls, 2) if self.db_calls else 0,
+            "llm_calls": self.llm_calls,
+            "db_calls": self.db_calls
+        }
+
+metrics_collector = MetricsCollector()
+
+# ==================== AUTHENTICATION ====================
+
 security = HTTPBearer()
 
-# Auth Models
 class LoginRequest(BaseModel):
     email: str
     password: str
@@ -46,10 +416,7 @@ class TokenData(BaseModel):
     email: Optional[str] = None
     role: Optional[str] = None
 
-# ==================== DATABASE USER AUTHENTICATION ====================
-
 def get_user_from_db(email: str):
-    """Get user from PostgreSQL database"""
     try:
         with engine.connect() as conn:
             result = conn.execute(
@@ -61,11 +428,9 @@ def get_user_from_db(email: str):
                 return {"email": row[0], "role": row[1], "password": row[2]}
             return None
     except Exception as e:
-        print(f"Database error: {e}")
         return None
 
 def authenticate_user(email: str, password: str):
-    """Authenticate user from database"""
     user = get_user_from_db(email)
     if user and user["password"] == password:
         return user
@@ -84,13 +449,12 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer"},
     )
     
     try:
         payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
-        email: str = payload.get("sub")
-        role: str = payload.get("role")
+        email = payload.get("sub")
+        role = payload.get("role")
         if email is None:
             raise credentials_exception
         return TokenData(email=email, role=role)
@@ -102,54 +466,18 @@ def require_role(required_role: str):
         if current_user.role != required_role and current_user.role != "admin":
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Role '{required_role}' required. You have '{current_user.role}'"
+                detail=f"Role '{required_role}' required"
             )
         return current_user
     return role_checker
 
-# ==================== MAIN APP ====================
-
-# Setup PostgreSQL
-DATABASE_URL = os.getenv('DATABASE_URL')
-engine = create_engine(DATABASE_URL, poolclass=NullPool)
-
-# Setup Gemini
-genai.configure(api_key=os.getenv('GOOGLE_API_KEY'))
-model = genai.GenerativeModel('gemini-2.5-flash-lite')
-
-app = FastAPI(title="AI Data Analyst Copilot", version="2.0.0")
-
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Request/Response Models
-class AskRequest(BaseModel):
-    question: str
-
-class AskResponse(BaseModel):
-    answer: str
-    sql_used: str
-    data: List[Dict[str, Any]]
-    metadata: Dict[str, Any]
-
-# Cache
-query_cache = {}
-
-def get_cache_key(question: str) -> str:
-    return hashlib.md5(question.lower().strip().encode()).hexdigest()
+# ==================== HELPER FUNCTIONS ====================
 
 def clean_sql(sql_text: str) -> str:
     sql_text = re.sub(r'```sql\s*', '', sql_text)
     sql_text = re.sub(r'```\s*', '', sql_text)
     sql_text = re.sub(r'`', '', sql_text)
     sql_text = re.sub(r'^sql\s*', '', sql_text, flags=re.IGNORECASE)
-    sql_text = re.sub(r'\n+', ' ', sql_text)
     return sql_text.strip()
 
 def convert_value(val):
@@ -159,52 +487,47 @@ def convert_value(val):
         return float(val)
     if isinstance(val, (int, float)):
         return val
-    if isinstance(val, (list, dict)):
-        return val
     if hasattr(val, 'isoformat'):
         return val.isoformat()
-    if isinstance(val, bytes):
-        return val.decode('utf-8', errors='ignore')
     return str(val)
 
-def get_schema_info() -> Dict[str, Any]:
-    inspector = inspect(engine)
-    schema = {}
-    for table_name in inspector.get_table_names():
-        columns = []
-        for col in inspector.get_columns(table_name):
-            columns.append({
-                "name": col['name'],
-                "type": str(col['type']),
-                "nullable": col['nullable'],
-                "default": str(col['default']) if col['default'] else None
-            })
-        schema[table_name] = columns
-    return schema
+def format_currency(value: float) -> str:
+    if value >= 1_000_000:
+        return f"${value:,.2f}M"
+    elif value >= 1_000:
+        return f"${value:,.2f}"
+    return f"${value:.2f}"
 
-def format_schema_for_prompt(schema: Dict[str, Any]) -> str:
-    result = ""
-    for table, columns in schema.items():
-        result += f"\nTable: {table}\n"
-        result += "Columns:\n"
-        for col in columns:
-            result += f"  - {col['name']} ({col['type']})"
-            if not col['nullable']:
-                result += " NOT NULL"
-            result += "\n"
-    return result
+def format_number(value: float) -> str:
+    return f"{int(value):,}" if value == int(value) else f"{value:,.2f}"
 
-# ==================== AUTH ENDPOINTS ====================
+# ==================== API MODELS ====================
+
+class AskRequest(BaseModel):
+    question: str = Field(..., min_length=1, max_length=500)
+
+class AskResponse(BaseModel):
+    success: bool
+    answer: str
+    sql_used: str
+    sql_explanation: str
+    data: List[Dict[str, Any]]
+    metrics: List[Dict[str, Any]]
+    chart: Optional[Dict[str, Any]]
+    formatting_rules: List[Dict[str, Any]]
+    query_cost: Dict[str, Any]
+    metadata: Dict[str, Any]
+    request_id: str
+    api_version: str
+
+# ==================== ENDPOINTS ====================
 
 @app.post("/login", response_model=Token)
-def login(request: LoginRequest):
-    user = authenticate_user(request.email, request.password)
+@limiter.limit(RATE_LIMIT)
+def login(request: Request, login_req: LoginRequest):
+    user = authenticate_user(login_req.email, login_req.password)
     if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect email or password",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+        raise HTTPException(status_code=401, detail="Invalid credentials")
     
     access_token = create_access_token(
         data={"sub": user["email"], "role": user["role"]}
@@ -217,250 +540,136 @@ def login(request: LoginRequest):
         role=user["role"]
     )
 
-@app.get("/protected")
-def protected_route(current_user: TokenData = Depends(get_current_user)):
-    return {
-        "message": f"Hello {current_user.email}",
-        "role": current_user.role,
-        "access": "granted"
-    }
-
-@app.get("/admin-only")
-def admin_route(current_user: TokenData = Depends(require_role("admin"))):
-    return {"message": "Welcome Admin!"}
-
-@app.get("/me")
-def get_me(current_user: TokenData = Depends(get_current_user)):
-    return {
-        "email": current_user.email,
-        "role": current_user.role
-    }
-
-# ==================== MONITORING ENDPOINT ====================
-
-@app.get("/monitoring/stats")
-def get_stats(current_user: TokenData = Depends(require_role("admin"))):
-    """Get monitoring statistics (Admin only)"""
-    return monitor.get_stats()
-
-# ==================== PUBLIC ENDPOINTS ====================
-
-@app.get("/")
-def home():
-    return {
-        "status": "running", 
-        "database": "PostgreSQL",
-        "version": "2.0.0",
-        "auth_required": True,
-        "endpoints": ["/login", "/ask", "/health", "/schema", "/tables", "/protected", "/admin-only", "/me", "/monitoring/stats"]
-    }
-
 @app.get("/health")
 def health():
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-        return {"status": "healthy", "database": "connected"}
-    except Exception as e:
-        return {"status": "unhealthy", "error": str(e)}
+    return {"status": "healthy", "version": "4.0.0"}
 
-@app.get("/schema")
-def get_schema(current_user: TokenData = Depends(get_current_user)):
-    """Get database schema (requires authentication)"""
-    try:
-        schema = get_schema_info()
-        return {"schema": schema}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/tables")
-def get_tables(current_user: TokenData = Depends(get_current_user)):
-    """List all tables (requires authentication)"""
-    try:
-        inspector = inspect(engine)
-        return {"tables": inspector.get_table_names()}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# ==================== MAIN ASK ENDPOINT (PROTECTED) ====================
-
-@app.post("/ask", response_model=AskResponse)
-def ask(
+@app.post("/ask")
+@limiter.limit(RATE_LIMIT)
+async def ask(
+    request: Request,
     req: AskRequest,
     current_user: TokenData = Depends(get_current_user)
 ):
+    request_id = str(uuid.uuid4())
     start_time = time.time()
     
-    # Check cache
-    cache_key = get_cache_key(req.question)
-    if cache_key in query_cache:
-        cached = query_cache[cache_key]
-        cached["metadata"]["cached"] = True
-        return cached
+    # Get rate limit for user role
+    if current_user.role == "admin":
+        limiter.limit(RATE_LIMIT_ADMIN)(ask)
     
     try:
-        # Get schema
-        schema = get_schema_info()
+        # Get cached schema with hash
+        schema, schema_hash = get_schema_info_cached()
         schema_text = format_schema_for_prompt(schema)
         
-        # Generate SQL
-        sql_prompt = f"""You are an expert SQL query generator for PostgreSQL.
-
-Database Schema:
-{schema_text}
-
-User Question: {req.question}
-
-Instructions:
-1. Write ONLY the SQL query to answer this question
-2. Use proper PostgreSQL syntax
-3. DO NOT use backticks, ```sql, or markdown formatting
-4. Output ONLY the SQL query text
-5. Use table aliases for better readability
-6. Include proper GROUP BY when using aggregations
-
-SQL:"""
+        # Check cache
+        cached = query_cache.get(current_user.email, req.question, schema_hash)
+        if cached:
+            cached["metadata"]["cached"] = True
+            cached["request_id"] = request_id
+            return cached
         
-        sql_response = model.generate_content(sql_prompt)
-        raw_sql = sql_response.text.strip()
-        sql_query = clean_sql(raw_sql)
+        # Generate SQL with hardened prompt
+        llm_start = time.time()
+        sql_prompt = get_sql_prompt(schema_text, req.question)
+        sql_response = await async_generate_content(sql_prompt)
+        llm_duration = (time.time() - llm_start) * 1000
+        metrics_collector.record_llm(llm_duration)
         
-        print(f"\n{'='*50}")
-        print(f"User: {current_user.email} ({current_user.role})")
-        print(f"Question: {req.question}")
-        print(f"SQL: {sql_query}")
-        print(f"{'='*50}\n")
+        sql_query = clean_sql(sql_response.strip())
         
-        # Execute SQL
-        with engine.connect() as conn:
-            result = conn.execute(text(sql_query))
-            rows = result.fetchall()
-            columns = list(result.keys())
-            
-            # Convert to dict list
-            data = []
-            for row in rows[:100]:
-                row_dict = {}
-                for i, col in enumerate(columns):
-                    row_dict[col] = convert_value(row[i])
-                data.append(row_dict)
+        # AST Validation
+        is_valid_ast, ast_error = validate_sql_ast(sql_query)
+        if not is_valid_ast:
+            raise HTTPException(status_code=400, detail=ast_error)
         
-        # Generate explanation with IMPROVED FORMAT
-        df = pd.DataFrame(data) if data else pd.DataFrame()
+        # Read-only validation
+        is_valid_ro, ro_error = validate_sql_readonly(sql_query)
+        if not is_valid_ro:
+            raise HTTPException(status_code=403, detail=ro_error)
         
-        # Create summary statistics
-        summary = {}
-        if not df.empty:
-            numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
-            for col in numeric_cols[:5]:
-                summary[col] = {
-                    "total": float(df[col].sum()),
-                    "average": float(df[col].mean()),
-                    "min": float(df[col].min()),
-                    "max": float(df[col].max())
-                }
+        # Enforce row limit
+        sql_query = enforce_limit(sql_query)
         
-        # IMPROVED PROMPT - Structured Business Response
-        explain_prompt = f"""You are an expert Business Analyst. Analyze the data below and provide a structured business report.
-
-QUESTION: {req.question}
-
-SQL QUERY USED: {sql_query}
-
-DATA SUMMARY:
-- Total rows: {len(data)}
-- Columns: {columns}
-
-SAMPLE DATA (first 5 rows):
-{data[:5] if data else 'No data'}
-
-STATISTICS:
-{json.dumps(summary, indent=2) if summary else 'No numeric columns found'}
-
-Now provide your analysis in this EXACT format:
-
-📊 ANSWER: (1 sentence answering the question directly with key numbers)
-
-💡 INSIGHT: (1-2 sentences highlighting the most important finding. Which product/region/category performed best? Which performed worst? Include specific numbers)
-
-📈 COMPARISON: (Compare the best vs worst. Calculate ratio if possible. Example: "X is Y times higher than Z")
-
-🏢 BUSINESS INTERPRETATION: (What does this mean for the business? Which category is driving performance?)
-
-🎯 RECOMMENDATION: (1 actionable business recommendation based on the data)
-
-IMPORTANT: Use the actual numbers from the data above. Be specific. Do NOT make up numbers.
-
-Your response:"""
+        # Estimate query cost
+        query_cost = estimate_query_cost(sql_query)
         
-        explanation = model.generate_content(explain_prompt)
+        # Execute query
+        db_start = time.time()
+        rows, columns = await async_execute_sql(sql_query)
+        db_duration = (time.time() - db_start) * 1000
+        metrics_collector.record_db(db_duration)
         
+        # Process results
+        data = []
+        for row in rows[:MAX_ROWS_RETURN]:
+            row_dict = {}
+            for i, col in enumerate(columns):
+                row_dict[col] = convert_value(row[i])
+            data.append(row_dict)
+        
+        # Generate response
         duration_ms = round((time.time() - start_time) * 1000, 2)
         
         response = {
-            "answer": explanation.text,
+            "success": True,
+            "answer": f"Found {len(data)} records",
             "sql_used": sql_query,
+            "sql_explanation": "Query executed successfully",
             "data": data,
+            "metrics": [],
+            "chart": None,
+            "formatting_rules": [],
+            "query_cost": query_cost,
             "metadata": {
                 "row_count": len(data),
-                "columns": columns,
                 "query_time_ms": duration_ms,
+                "llm_time_ms": llm_duration,
+                "db_time_ms": db_duration,
                 "cached": False,
-                "user": current_user.email,
-                "role": current_user.role
-            }
+                "user": current_user.email
+            },
+            "request_id": request_id,
+            "api_version": "4.0.0"
         }
         
-        # Log to monitoring
-        monitor.log_request(
-            user=current_user.email,
-            question=req.question,
-            sql=sql_query,
-            duration_ms=duration_ms,
-            status=200
-        )
-        
-        # Cache results
-        if len(query_cache) > 100:
-            oldest_key = next(iter(query_cache))
-            del query_cache[oldest_key]
-        query_cache[cache_key] = response
-        
+        query_cache.set(current_user.email, req.question, schema_hash, response)
         return response
         
+    except HTTPException:
+        raise
     except Exception as e:
-        error_msg = str(e)
-        duration_ms = round((time.time() - start_time) * 1000, 2)
-        
-        print(f"Error: {error_msg}")
-        
-        # Log error to monitoring
-        monitor.log_request(
-            user=current_user.email,
-            question=req.question,
-            sql="Error generating SQL",
-            duration_ms=duration_ms,
-            status=500
-        )
-        
+        error_response = sanitize_error_response(e, current_user.role)
         return {
-            "answer": f"Sorry, I couldn't answer that question. Error: {error_msg[:200]}",
-            "sql_used": "Error generating SQL",
+            "success": False,
+            "answer": error_response["message"],
+            "sql_used": "",
+            "sql_explanation": "",
             "data": [],
-            "metadata": {
-                "error": error_msg,
-                "query_time_ms": duration_ms,
-                "user": current_user.email
-            }
+            "metrics": [],
+            "chart": None,
+            "formatting_rules": [],
+            "query_cost": {},
+            "metadata": {"error": error_response.get("error_type", "Unknown")},
+            "request_id": request_id,
+            "api_version": "4.0.0"
         }
 
-# ==================== RUN SERVER ====================
+@app.get("/metrics/stats")
+@limiter.limit(RATE_LIMIT_ADMIN)
+async def get_metrics(current_user: TokenData = Depends(require_role("admin"))):
+    """Get observability metrics (admin only)"""
+    return {
+        "llm_performance": {
+            "avg_ms": metrics_collector.llm_total_time / metrics_collector.llm_calls if metrics_collector.llm_calls else 0,
+            "total_calls": metrics_collector.llm_calls
+        },
+        "db_performance": {
+            "avg_ms": metrics_collector.db_total_time / metrics_collector.db_calls if metrics_collector.db_calls else 0,
+            "total_calls": metrics_collector.db_calls
+        }
+    }
 
 if __name__ == "__main__":
-    uvicorn.run(
-        "app:app", 
-        host="127.0.0.1", 
-        port=8000, 
-        reload=True,
-        log_level="info"
-    )
+    uvicorn.run("app:app", host="127.0.0.1", port=8000, reload=True)
