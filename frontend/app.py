@@ -207,7 +207,6 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# FIXED: Using the CORRECT backend URL - UPDATED!
 state = AppState()
 api_client = APIClient("https://ai-analyst-copilot-s5og.onrender.com")
 
@@ -303,7 +302,10 @@ def show_main_app():
                 st.rerun()
         
         st.markdown("---")
-        st.info("✅ PostgreSQL Connected\n✅ Gemini AI Ready")
+        # GEMINI AI READY REMOVED - Now showing Groq AI instead
+        st.info("✅ PostgreSQL Connected")
+        st.info("✅ Groq AI Ready")
+        st.info("✅ RAG System Active")
 
     if state.page == "monitoring":
         show_monitoring()
