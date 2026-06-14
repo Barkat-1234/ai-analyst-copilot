@@ -12,6 +12,3 @@ requests
 sqlglot
 passlib
 chromadb
-sentence-transformers
-langchain
-langchain-community
