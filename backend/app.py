@@ -22,8 +22,8 @@ from jose import JWTError, jwt
 import uuid
 import traceback
 
-# Import RAG system
-from rag import RAGSystem
+# Import RAG system - FIXED with dot
+from .rag import RAGSystem
 
 load_dotenv()
 
