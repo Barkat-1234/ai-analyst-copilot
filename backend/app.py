@@ -23,7 +23,7 @@ import uuid
 import asyncio
 import sqlglot
 from sqlglot import parse_one, errors
-from functools import lru_cache
+from passlib.context import CryptContext
 from contextlib import contextmanager
 
 load_dotenv()
@@ -38,12 +38,21 @@ ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "480"
 MAX_QUERY_TIMEOUT_SECONDS = 30
 MAX_ROWS_RETURN = 1000
 MAX_ROWS_LIMIT = 500
+RATE_LIMIT_REQUESTS = 20
+RATE_LIMIT_PERIOD = 60  # seconds
+
 FORBIDDEN_SQL_KEYWORDS = ['DROP', 'DELETE', 'UPDATE', 'INSERT', 'ALTER', 'CREATE', 'TRUNCATE', 'GRANT', 'REVOKE', 'MERGE', 'REPLACE']
+
+# Password hashing
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 # Cache Configuration
 SCHEMA_CACHE_TTL = 3600
 QUERY_CACHE_MAX_SIZE = 100
 QUERY_CACHE_TTL = 300
+
+# Rate limiting storage
+rate_limit_storage = {}
 
 # PostgreSQL Setup
 DATABASE_URL = os.getenv('DATABASE_URL')
@@ -62,7 +71,7 @@ model = genai.GenerativeModel('gemini-2.5-flash-lite')
 
 # ==================== FASTAPI APP ====================
 
-app = FastAPI(title="AI Data Analyst Copilot", version="4.0.0")
+app = FastAPI(title="AI Data Analyst Copilot", version="5.0.0")
 
 # ==================== CORS MIDDLEWARE ====================
 
@@ -77,7 +86,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS", "PUT", "DELETE"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
     expose_headers=["*"],
     max_age=3600,
@@ -88,9 +97,41 @@ app.add_middleware(
     allowed_hosts=["*"]
 )
 
+# ==================== RATE LIMITING ====================
+
+def check_rate_limit(user_email: str) -> Tuple[bool, int]:
+    """Check if user has exceeded rate limit"""
+    now = time.time()
+    key = f"rate_limit:{user_email}"
+    
+    if key not in rate_limit_storage:
+        rate_limit_storage[key] = []
+    
+    # Clean old requests
+    rate_limit_storage[key] = [t for t in rate_limit_storage[key] if now - t < RATE_LIMIT_PERIOD]
+    
+    if len(rate_limit_storage[key]) >= RATE_LIMIT_REQUESTS:
+        oldest = min(rate_limit_storage[key])
+        wait_time = int(RATE_LIMIT_PERIOD - (now - oldest))
+        return False, wait_time
+    
+    rate_limit_storage[key].append(now)
+    return True, 0
+
+# ==================== PASSWORD HASHING ====================
+
+def hash_password(password: str) -> str:
+    """Hash a password using bcrypt"""
+    return pwd_context.hash(password)
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """Verify a password against its hash"""
+    return pwd_context.verify(plain_password, hashed_password)
+
 # ==================== SQL VALIDATION ====================
 
 def validate_sql_ast(sql_query: str) -> Tuple[bool, str]:
+    """Use sqlglot to validate SQL syntax and structure"""
     try:
         parsed = parse_one(sql_query, dialect="postgres")
         first_keyword = str(parsed).upper().split()[0] if parsed else ""
@@ -100,8 +141,24 @@ def validate_sql_ast(sql_query: str) -> Tuple[bool, str]:
     except errors.ParseError as e:
         return False, f"SQL syntax error: {str(e)}"
 
+def check_multiple_statements(sql_query: str) -> Tuple[bool, str]:
+    """Block multiple SQL statements separated by semicolons"""
+    # Count semicolons not inside quotes
+    in_quote = False
+    semicolon_count = 0
+    
+    for i, char in enumerate(sql_query):
+        if char == "'" and (i == 0 or sql_query[i-1] != '\\'):
+            in_quote = not in_quote
+        elif char == ';' and not in_quote:
+            semicolon_count += 1
+    
+    if semicolon_count > 1:
+        return False, "Multiple SQL statements are not allowed"
+    return True, "OK"
+
 def enforce_limit(sql_query: str) -> str:
-    # Remove any semicolon before adding LIMIT (FIXED)
+    """Enforce row limit on SQL queries"""
     sql_query = sql_query.rstrip(';').strip()
     
     sql_upper = sql_query.upper()
@@ -119,21 +176,30 @@ def enforce_limit(sql_query: str) -> str:
     return sql_query
 
 def validate_sql_readonly(sql_query: str) -> Tuple[bool, str]:
+    """Validate SQL is read-only"""
     sql_upper = sql_query.upper()
     for keyword in FORBIDDEN_SQL_KEYWORDS:
         if re.search(rf'\b{keyword}\b', sql_upper):
             return False, f"SQL contains forbidden keyword: {keyword}"
     return True, "OK"
 
-# ==================== CLEAN SQL FUNCTION - FIXED ====================
+# ==================== QUERY TIMEOUT ====================
+
+def check_query_timeout(start_time: float) -> bool:
+    """Check if query has exceeded timeout"""
+    elapsed = time.time() - start_time
+    if elapsed > MAX_QUERY_TIMEOUT_SECONDS:
+        return False
+    return True
+
+# ==================== CLEAN SQL FUNCTION ====================
 
 def clean_sql(sql_text: str) -> str:
-    """Remove markdown, backticks, and semicolons from SQL"""
+    """Remove markdown, backticks, and clean SQL"""
     sql_text = re.sub(r'```sql\s*', '', sql_text)
     sql_text = re.sub(r'```\s*', '', sql_text)
     sql_text = re.sub(r'`', '', sql_text)
     sql_text = re.sub(r'^sql\s*', '', sql_text, flags=re.IGNORECASE)
-    # Remove semicolons (FIXED)
     sql_text = sql_text.replace(';', '')
     return sql_text.strip()
 
@@ -220,7 +286,7 @@ def format_schema_for_prompt(schema: Dict[str, Any]) -> str:
             result += "\n"
     return result
 
-# ==================== AUTHENTICATION ====================
+# ==================== AUTHENTICATION WITH PASSWORD HASHING ====================
 
 security = HTTPBearer()
 
@@ -255,7 +321,10 @@ def get_user_from_db(email: str):
 
 def authenticate_user(email: str, password: str):
     user = get_user_from_db(email)
-    if user and user["password"] == password:
+    if not user:
+        return None
+    # Use password hashing verification
+    if verify_password(password, user["password"]):
         return user
     return None
 
@@ -322,6 +391,14 @@ class AskRequest(BaseModel):
 
 @app.post("/login", response_model=Token)
 def login(request: Request, login_req: LoginRequest):
+    # Rate limiting check
+    allowed, wait_time = check_rate_limit(login_req.email)
+    if not allowed:
+        raise HTTPException(
+            status_code=429, 
+            detail=f"Rate limit exceeded. Try again in {wait_time} seconds"
+        )
+    
     user = authenticate_user(login_req.email, login_req.password)
     if not user:
         raise HTTPException(status_code=401, detail="Invalid credentials")
@@ -339,7 +416,7 @@ def login(request: Request, login_req: LoginRequest):
 
 @app.get("/health")
 def health():
-    return {"status": "healthy", "version": "4.0.0"}
+    return {"status": "healthy", "version": "5.0.0"}
 
 @app.post("/ask")
 async def ask(
@@ -349,6 +426,14 @@ async def ask(
 ):
     request_id = str(uuid.uuid4())
     start_time = time.time()
+    
+    # Rate limiting check
+    allowed, wait_time = check_rate_limit(current_user.email)
+    if not allowed:
+        raise HTTPException(
+            status_code=429, 
+            detail=f"Rate limit exceeded. Try again in {wait_time} seconds"
+        )
     
     try:
         schema, schema_hash = get_schema_info_cached()
@@ -370,23 +455,39 @@ Write ONLY the SQL query (SELECT only):"""
         sql_response = model.generate_content(sql_prompt)
         sql_query = clean_sql(sql_response.text.strip())
         
+        # Security validations
+        is_valid_ast, ast_error = validate_sql_ast(sql_query)
+        if not is_valid_ast:
+            raise HTTPException(status_code=400, detail=ast_error)
+        
         is_valid_ro, ro_error = validate_sql_readonly(sql_query)
         if not is_valid_ro:
             raise HTTPException(status_code=403, detail=ro_error)
         
+        is_valid_multi, multi_error = check_multiple_statements(sql_query)
+        if not is_valid_multi:
+            raise HTTPException(status_code=400, detail=multi_error)
+        
         sql_query = enforce_limit(sql_query)
         
-        with engine.connect() as conn:
-            result = conn.execute(text(sql_query))
-            rows = result.fetchall()
-            columns = list(result.keys())
-            
-            data = []
-            for row in rows[:MAX_ROWS_RETURN]:
-                row_dict = {}
-                for i, col in enumerate(columns):
-                    row_dict[col] = convert_value(row[i])
-                data.append(row_dict)
+        # Execute with timeout
+        try:
+            with engine.connect() as conn:
+                result = conn.execute(text(sql_query))
+                rows = result.fetchall()
+                columns = list(result.keys())
+                
+                if not check_query_timeout(start_time):
+                    raise HTTPException(status_code=408, detail="Query timeout exceeded")
+                
+                data = []
+                for row in rows[:MAX_ROWS_RETURN]:
+                    row_dict = {}
+                    for i, col in enumerate(columns):
+                        row_dict[col] = convert_value(row[i])
+                    data.append(row_dict)
+        except SQLAlchemyError as e:
+            raise HTTPException(status_code=400, detail=f"Database error: {str(e)}")
         
         duration_ms = round((time.time() - start_time) * 1000, 2)
         
@@ -443,7 +544,7 @@ Write ONLY the SQL query (SELECT only):"""
                 "user": current_user.email
             },
             "request_id": request_id,
-            "api_version": "4.0.0"
+            "api_version": "5.0.0"
         }
         
         query_cache.set(current_user.email, req.question, schema_hash, response)
@@ -464,7 +565,7 @@ Write ONLY the SQL query (SELECT only):"""
             "query_cost": {},
             "metadata": {"error": str(e)},
             "request_id": request_id,
-            "api_version": "4.0.0"
+            "api_version": "5.0.0"
         }
 
 @app.get("/monitoring/stats")
