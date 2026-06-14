@@ -2,6 +2,7 @@ import streamlit as st
 import requests
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import json
 import logging
 import time
@@ -154,7 +155,141 @@ class APIClient:
         response.raise_for_status()
         return response.json()
 
-# ==================== RENDERER ====================
+# ==================== INTERACTIVE CHART RENDERER ====================
+
+class InteractiveChartRenderer:
+    """Renders interactive charts with zoom, pan, hover, and range slider"""
+    
+    @staticmethod
+    def render_chart(df: pd.DataFrame, chart: Dict) -> None:
+        """Render interactive chart based on backend configuration"""
+        if df.empty or not chart:
+            st.info("No data available for visualization")
+            return
+        
+        chart_type = chart.get("type", "bar")
+        x_col = chart.get("x_column")
+        y_col = chart.get("y_column")
+        title = chart.get("title", "Data Visualization")
+        
+        if not x_col or not y_col:
+            st.info("Chart configuration incomplete")
+            return
+        
+        if x_col not in df.columns or y_col not in df.columns:
+            st.info(f"Columns '{x_col}' or '{y_col}' not found")
+            return
+        
+        try:
+            if chart_type == "bar":
+                fig = px.bar(
+                    df,
+                    x=x_col,
+                    y=y_col,
+                    title=title,
+                    text_auto=True,
+                    color_discrete_sequence=['#4CAF50'],
+                    template='plotly_white'
+                )
+                # Check if currency for formatting
+                if 'revenue' in y_col.lower() or 'price' in y_col.lower():
+                    fig.update_traces(
+                        texttemplate='$%{y:,.2f}',
+                        textposition='outside',
+                        hovertemplate='<b>%{x}</b><br>Value: $%{y:,.2f}<extra></extra>'
+                    )
+                else:
+                    fig.update_traces(
+                        texttemplate='%{y:,.0f}',
+                        textposition='outside',
+                        hovertemplate='<b>%{x}</b><br>Value: %{y:,.0f}<extra></extra>'
+                    )
+                
+            elif chart_type == "line":
+                fig = px.line(
+                    df,
+                    x=x_col,
+                    y=y_col,
+                    title=title,
+                    markers=True,
+                    color_discrete_sequence=['#2196F3'],
+                    template='plotly_white'
+                )
+                fig.update_traces(
+                    line=dict(width=3),
+                    marker=dict(size=8),
+                    hovertemplate='<b>%{x}</b><br>Value: $%{y:,.2f}<extra></extra>'
+                )
+                
+                # Add range slider for time series
+                if len(df) > 10:
+                    fig.update_layout(
+                        xaxis=dict(
+                            rangeslider=dict(visible=True),
+                            type="date"
+                        )
+                    )
+            
+            elif chart_type == "pie":
+                fig = px.pie(
+                    df,
+                    values=y_col,
+                    names=x_col,
+                    title=title,
+                    color_discrete_sequence=px.colors.qualitative.Set3,
+                    template='plotly_white'
+                )
+                fig.update_traces(
+                    textposition='inside',
+                    textinfo='percent+label',
+                    hovertemplate='<b>%{label}</b><br>Value: $%{value:,.2f}<br>Percentage: %{percent}<extra></extra>'
+                )
+            
+            elif chart_type == "scatter":
+                fig = px.scatter(
+                    df,
+                    x=x_col,
+                    y=y_col,
+                    title=title,
+                    color_discrete_sequence=['#FF5722'],
+                    template='plotly_white',
+                    size=max(10, min(30, len(df)))
+                )
+                fig.update_traces(
+                    hovertemplate='<b>%{x}</b><br>Value: $%{y:,.2f}<extra></extra>'
+                )
+            
+            else:
+                st.info(f"Chart type '{chart_type}' not supported")
+                return
+            
+            # Common layout improvements
+            fig.update_layout(
+                height=500,
+                hovermode='closest',
+                dragmode='zoom',
+                clickmode='event+select',
+                title_font_size=18,
+                title_x=0.5,
+                font=dict(size=12),
+                plot_bgcolor='rgba(0,0,0,0)',
+                paper_bgcolor='rgba(0,0,0,0)'
+            )
+            
+            # Add toolbar for interactivity
+            config = {
+                'displayModeBar': True,
+                'scrollZoom': True,
+                'displaylogo': False,
+                'modeBarButtonsToRemove': ['lasso2d', 'select2d']
+            }
+            
+            st.plotly_chart(fig, use_container_width=True, config=config)
+            
+        except Exception as e:
+            st.warning(f"Could not generate chart: {str(e)[:100]}")
+
+# ==================== SIMPLE RENDERER ====================
 
 class Renderer:
     @staticmethod
@@ -164,20 +299,10 @@ class Renderer:
         cols = st.columns(min(len(metrics), 4))
         for idx, metric in enumerate(metrics[:4]):
             with cols[idx]:
-                st.metric(label=metric.get("label", ""), value=metric.get("value", ""))
-    
-    @staticmethod
-    def render_chart(df: pd.DataFrame, chart: Dict) -> None:
-        if df.empty or not chart:
-            return
-        if chart.get("type") == "bar":
-            fig = px.bar(
-                df, 
-                x=chart.get("x_column"), 
-                y=chart.get("y_column"),
-                title=chart.get("title")
-            )
-            st.plotly_chart(fig, use_container_width=True)
+                icon = metric.get("icon", "")
+                label = metric.get("label", "")
+                value = metric.get("value", "")
+                st.metric(label=f"{icon} {label}", value=value)
     
     @staticmethod
     def render_sql(sql_query: str, explanation: str) -> None:
@@ -302,7 +427,6 @@ def show_main_app():
                 st.rerun()
         
         st.markdown("---")
-        # GEMINI AI READY REMOVED - Now showing Groq AI instead
         st.info("✅ PostgreSQL Connected")
         st.info("✅ Groq AI Ready")
         st.info("✅ RAG System Active")
@@ -334,8 +458,7 @@ def show_main_app():
                     st.caption(f"⚡ {data['metadata']['query_time_ms']} ms")
                 
                 if data.get("sql_used"):
-                    with st.expander("🔍 View SQL Query"):
-                        st.code(data["sql_used"], language="sql")
+                    Renderer.render_sql(data["sql_used"], "")
                 
                 if data.get("data") and len(data["data"]) > 0:
                     df = pd.DataFrame(data["data"])
@@ -343,11 +466,15 @@ def show_main_app():
                     if data.get("metrics"):
                         Renderer.render_metrics(data["metrics"])
                     
-                    tab1, tab2 = st.tabs(["📊 Data Table", "📈 Chart"])
+                    # Create two tabs: Data Table and Interactive Chart
+                    tab1, tab2 = st.tabs(["📊 Data Table", "📈 Interactive Chart"])
+                    
                     with tab1:
                         Renderer.render_table(df)
+                    
                     with tab2:
-                        Renderer.render_chart(df, data.get("chart"))
+                        # Use interactive chart renderer
+                        InteractiveChartRenderer.render_chart(df, data.get("chart"))
                             
             except requests.exceptions.HTTPError as e:
                 if e.response.status_code == 401:
