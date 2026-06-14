@@ -21,7 +21,7 @@ from jose import JWTError, jwt
 import uuid
 import traceback
 
-# Import Groq instead of Gemini
+# Import Groq - NO Gemini!
 from groq import Groq
 
 # Import RAG system
@@ -50,9 +50,14 @@ engine = create_engine(DATABASE_URL, poolclass=QueuePool, pool_size=10, max_over
 # Initialize RAG System
 rag = RAGSystem()
 
-# Groq - Ultra-fast LLM (replaces Gemini)
-client = Groq(api_key=os.getenv('GROQ_API_KEY'))
-MODEL_NAME = "llama-3.3-70b-versatile"  # Fast, good quality
+# Groq - Ultra-fast LLM (NO Gemini!)
+# Get your API key from: https://console.groq.com/keys
+GROQ_API_KEY = os.getenv('GROQ_API_KEY')
+if not GROQ_API_KEY:
+    raise ValueError("GROQ_API_KEY environment variable not set")
+
+client = Groq(api_key=GROQ_API_KEY)
+MODEL_NAME = "llama-3.3-70b-versatile"  # or "mixtral-8x7b-32768"
 
 app = FastAPI(title="AI Data Analyst Copilot", version="7.0.0")
 
@@ -78,11 +83,8 @@ app.add_middleware(
 # ==================== 1. CHART/KPI DECISION ENGINE ====================
 
 class ChartDecisionEngine:
-    """Intelligently decides the best chart type based on data patterns"""
-    
     @staticmethod
     def detect_data_patterns(df: pd.DataFrame) -> Dict[str, Any]:
-        """Analyze data patterns to recommend best visualization"""
         patterns = {
             "has_time_series": False,
             "has_categories": False,
@@ -108,9 +110,6 @@ class ChartDecisionEngine:
     
     @staticmethod
     def decide_chart(df: pd.DataFrame, question: str, patterns: Dict) -> Dict[str, Any]:
-        """Decide the best chart type based on data and question intent"""
-        question_lower = question.lower()
-        
         chart_config = {
             "type": "bar",
             "x_column": None,
@@ -131,9 +130,6 @@ class ChartDecisionEngine:
             chart_config["y_column"] = patterns["numeric_columns"][0]
             chart_config["title"] = f"{patterns['numeric_columns'][0]} by {patterns['categorical_columns'][0]}"
             
-            if patterns["row_count"] <= 6 and "pie" in question_lower:
-                chart_config["type"] = "pie"
-                
         elif len(patterns["numeric_columns"]) >= 2:
             chart_config["type"] = "scatter"
             chart_config["x_column"] = patterns["numeric_columns"][0]
@@ -144,7 +140,6 @@ class ChartDecisionEngine:
 
     @staticmethod
     def generate_kpi_metrics(df: pd.DataFrame, patterns: Dict) -> List[Dict]:
-        """Generate relevant KPI metrics from data"""
         metrics = []
         
         metrics.append({
@@ -158,7 +153,7 @@ class ChartDecisionEngine:
             total = df[col].sum()
             avg = df[col].mean()
             
-            is_currency = "revenue" in col.lower() or "price" in col.lower() or "sales" in col.lower()
+            is_currency = "revenue" in col.lower() or "price" in col.lower()
             format_str = lambda x: f"${x:,.2f}" if is_currency else f"{x:,.0f}"
             
             metrics.append({
@@ -180,12 +175,8 @@ class ChartDecisionEngine:
 # ==================== 2. INSIGHT GENERATION LAYER ====================
 
 class InsightGenerator:
-    """Generates business insights from data without exposing raw dataframes"""
-    
     @staticmethod
     def generate_insights(df: pd.DataFrame, question: str, patterns: Dict) -> Dict[str, Any]:
-        """Generate structured insights from data"""
-        
         insights = {
             "summary": "",
             "key_findings": [],
@@ -224,22 +215,6 @@ class InsightGenerator:
                     ratio = top_value / bottom_value if bottom_value > 0 else 0
                     if ratio > 2:
                         insights["key_findings"].append(f"Top performer is {ratio:.1f}x higher than lowest performer")
-        
-        if patterns["numeric_columns"]:
-            num_col = patterns["numeric_columns"][0]
-            if df[num_col].sum() > 10000:
-                insights["recommendations"].append(f"Strong total {num_col} - consider increasing investment")
-            if df[num_col].mean() > df[num_col].median():
-                insights["recommendations"].append("High-value outliers detected - review top performers")
-        
-        if patterns["numeric_columns"]:
-            num_col = patterns["numeric_columns"][0]
-            mean_val = df[num_col].mean()
-            std_val = df[num_col].std()
-            anomalies = df[df[num_col] > mean_val + 2 * std_val]
-            
-            if len(anomalies) > 0:
-                insights["anomalies"].append(f"Found {len(anomalies)} unusually high values")
         
         return insights
 
@@ -382,8 +357,6 @@ def format_schema_for_prompt(schema):
             result += f"  - {col['name']} ({col['type']})\n"
     return result
 
-# ==================== HELPER FUNCTIONS ====================
-
 def convert_value(val):
     if val is None:
         return None
@@ -394,8 +367,6 @@ def convert_value(val):
     if hasattr(val, 'isoformat'):
         return val.isoformat()
     return str(val)
-
-# ==================== API MODELS ====================
 
 class AskRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=500)
@@ -439,10 +410,8 @@ async def ask(
     request_counter += 1
     
     try:
-        # ==================== RAG STEP 1: SEARCH KNOWLEDGE BASE ====================
         rag_results = rag.search(req.question, top_k=3)
         
-        # Build context from RAG results
         rag_context = ""
         if rag_results:
             rag_context = "\n\nRelevant Knowledge from Database:\n"
@@ -453,7 +422,7 @@ async def ask(
         tables = list(schema.keys())
         schema_text = format_schema_for_prompt(schema)
         
-        # ==================== RAG STEP 2: AUGMENT PROMPT WITH CONTEXT ====================
+        # GROQ API CALL for SQL (NO GEMINI!)
         sql_prompt = f"""Tables: {tables}
 Schema:
 {schema_text}
@@ -461,11 +430,9 @@ Schema:
 
 Question: {req.question}
 
-Use the schema above and any relevant knowledge to write the SQL query.
-SQL:"""
+Write ONLY the SQL query (SELECT only):"""
         
-        # GROQ API CALL for SQL generation
-        chat_completion = client.chat.completions.create(
+        sql_completion = client.chat.completions.create(
             messages=[
                 {"role": "system", "content": "You are a SQL generator. Output ONLY the SQL query, no explanations, no markdown."},
                 {"role": "user", "content": sql_prompt}
@@ -473,10 +440,9 @@ SQL:"""
             model=MODEL_NAME,
             temperature=0.0,
         )
-        sql_query = clean_sql(chat_completion.choices[0].message.content)
+        sql_query = clean_sql(sql_completion.choices[0].message.content)
         
         print(f"Generated SQL: {sql_query}")
-        print(f"RAG Context Used: {len(rag_results)} documents retrieved")
         
         is_valid, error_msg = validate_sql_readonly(sql_query)
         if not is_valid:
@@ -515,25 +481,17 @@ SQL:"""
             }
         
         df = pd.DataFrame(data)
-        
-        # Detect patterns
         patterns = ChartDecisionEngine.detect_data_patterns(df)
-        
-        # Generate chart config
         chart_config = ChartDecisionEngine.decide_chart(df, req.question, patterns)
-        
-        # Generate KPI metrics
         kpi_metrics = ChartDecisionEngine.generate_kpi_metrics(df, patterns)
-        
-        # Generate insights
         insights = InsightGenerator.generate_insights(df, req.question, patterns)
         
-        # ==================== GROQ API CALL for Answer Generation ====================
+        # GROQ API CALL for Answer (NO GEMINI!)
         answer_prompt = f"""Question: {req.question}
 Insights: {json.dumps(insights, indent=2)}
 {rag_context}
 
-Provide a concise business answer (2-3 sentences). If the knowledge base has relevant information, incorporate it:"""
+Provide a concise business answer (2-3 sentences):"""
         
         answer_completion = client.chat.completions.create(
             messages=[
