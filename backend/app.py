@@ -42,9 +42,9 @@ error_counter = 0
 DATABASE_URL = os.getenv('DATABASE_URL')
 engine = create_engine(DATABASE_URL, poolclass=QueuePool, pool_size=10, max_overflow=20, pool_pre_ping=True)
 
-# Gemini - Using gemini-1.5-flash for better free tier limits
+# Gemini - Using gemini-2.0-flash
 genai.configure(api_key=os.getenv('GOOGLE_API_KEY'))
-model = genai.GenerativeModel('gemini-1.5-flash')
+model = genai.GenerativeModel('gemini-2.0-flash')
 
 app = FastAPI(title="AI Data Analyst Copilot", version="7.0.0")
 
