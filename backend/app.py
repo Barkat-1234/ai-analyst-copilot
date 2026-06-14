@@ -34,6 +34,11 @@ MAX_ROWS_LIMIT = 500
 MAX_ROWS_RETURN = 1000
 FORBIDDEN_SQL_KEYWORDS = ['DROP', 'DELETE', 'UPDATE', 'INSERT', 'ALTER', 'CREATE', 'TRUNCATE', 'GRANT', 'REVOKE']
 
+# Request counter for monitoring
+request_counter = 0
+total_response_time = 0
+error_counter = 0
+
 # Database
 DATABASE_URL = os.getenv('DATABASE_URL')
 engine = create_engine(DATABASE_URL, poolclass=QueuePool, pool_size=10, max_overflow=20, pool_pre_ping=True)
@@ -267,8 +272,12 @@ async def ask(
     req: AskRequest,
     current_user: TokenData = Depends(get_current_user)
 ):
+    global request_counter, total_response_time, error_counter
     request_id = str(uuid.uuid4())
     start_time = time.time()
+    
+    # Increment request counter
+    request_counter += 1
     
     try:
         # Get schema and tables
@@ -300,6 +309,7 @@ SQL:"""
         # Validate
         is_valid, error_msg = validate_sql_readonly(sql_query)
         if not is_valid:
+            error_counter += 1
             raise HTTPException(status_code=403, detail=error_msg)
         
         sql_query = enforce_limit(sql_query)
@@ -323,6 +333,7 @@ SQL:"""
                 data.append(row_dict)
         
         duration_ms = round((time.time() - start_time) * 1000, 2)
+        total_response_time += duration_ms
         
         # Generate metrics
         metrics = []
@@ -393,8 +404,10 @@ Provide a brief business answer (1-2 sentences):"""
         return response
         
     except HTTPException:
+        error_counter += 1
         raise
     except Exception as e:
+        error_counter += 1
         error_full = traceback.format_exc()
         print(f"ERROR in /ask: {error_full}")
         
@@ -415,10 +428,20 @@ Provide a brief business answer (1-2 sentences):"""
 
 @app.get("/monitoring/stats")
 async def get_monitoring_stats(current_user: TokenData = Depends(require_role("admin"))):
+    global request_counter, total_response_time, error_counter
+    
+    avg_response_time = 0
+    if request_counter > 0:
+        avg_response_time = total_response_time / request_counter
+    
+    error_rate = 0
+    if request_counter > 0:
+        error_rate = (error_counter / request_counter) * 100
+    
     return {
-        "total_requests": 0,
-        "avg_response_time_ms": 0,
-        "error_rate": 0,
+        "total_requests": request_counter,
+        "avg_response_time_ms": round(avg_response_time, 2),
+        "error_rate": round(error_rate, 2),
         "status": "healthy"
     }
 
