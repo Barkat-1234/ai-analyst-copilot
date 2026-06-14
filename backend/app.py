@@ -1,6 +1,5 @@
 import os
 import re
-import google.generativeai as genai
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Depends, status, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -22,7 +21,10 @@ from jose import JWTError, jwt
 import uuid
 import traceback
 
-# Import RAG system - FIXED with dot
+# Import Groq instead of Gemini
+from groq import Groq
+
+# Import RAG system
 from .rag import RAGSystem
 
 load_dotenv()
@@ -48,9 +50,9 @@ engine = create_engine(DATABASE_URL, poolclass=QueuePool, pool_size=10, max_over
 # Initialize RAG System
 rag = RAGSystem()
 
-# Gemini - Using gemini-2.0-flash
-genai.configure(api_key=os.getenv('GOOGLE_API_KEY'))
-model = genai.GenerativeModel('gemini-2.0-flash')
+# Groq - Ultra-fast LLM (replaces Gemini)
+client = Groq(api_key=os.getenv('GROQ_API_KEY'))
+MODEL_NAME = "llama-3.3-70b-versatile"  # Fast, good quality
 
 app = FastAPI(title="AI Data Analyst Copilot", version="7.0.0")
 
@@ -462,8 +464,16 @@ Question: {req.question}
 Use the schema above and any relevant knowledge to write the SQL query.
 SQL:"""
         
-        sql_response = model.generate_content(sql_prompt)
-        sql_query = clean_sql(sql_response.text.strip())
+        # GROQ API CALL for SQL generation
+        chat_completion = client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": "You are a SQL generator. Output ONLY the SQL query, no explanations, no markdown."},
+                {"role": "user", "content": sql_prompt}
+            ],
+            model=MODEL_NAME,
+            temperature=0.0,
+        )
+        sql_query = clean_sql(chat_completion.choices[0].message.content)
         
         print(f"Generated SQL: {sql_query}")
         print(f"RAG Context Used: {len(rag_results)} documents retrieved")
@@ -518,14 +528,22 @@ SQL:"""
         # Generate insights
         insights = InsightGenerator.generate_insights(df, req.question, patterns)
         
-        # ==================== RAG STEP 3: USE RAG CONTEXT IN ANSWER ====================
+        # ==================== GROQ API CALL for Answer Generation ====================
         answer_prompt = f"""Question: {req.question}
 Insights: {json.dumps(insights, indent=2)}
 {rag_context}
 
 Provide a concise business answer (2-3 sentences). If the knowledge base has relevant information, incorporate it:"""
         
-        answer = model.generate_content(answer_prompt).text
+        answer_completion = client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": "You are a business analyst. Provide concise, insightful answers."},
+                {"role": "user", "content": answer_prompt}
+            ],
+            model=MODEL_NAME,
+            temperature=0.5,
+        )
+        answer = answer_completion.choices[0].message.content
         
         duration_ms = round((time.time() - start_time) * 1000, 2)
         total_response_time += duration_ms
