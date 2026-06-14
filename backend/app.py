@@ -23,7 +23,7 @@ import uuid
 import traceback
 
 # Import RAG system - FIXED with dot
-from rag import RAGSystem
+from .rag import RAGSystem
 
 load_dotenv()
 
