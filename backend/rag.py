@@ -1,7 +1,7 @@
-# backend/rag.py - RAG System for knowledge retrieval
+# backend/rag.py - Lightweight RAG System (No PyTorch, Memory Efficient)
 import os
 import chromadb
-from sentence_transformers import SentenceTransformer
+from chromadb.utils import embedding_functions
 from typing import List, Dict, Any
 
 class RAGSystem:
@@ -12,24 +12,24 @@ class RAGSystem:
         # Initialize ChromaDB
         self.client = chromadb.PersistentClient(path=persist_dir)
         
-        # Create or get collection
+        # Collection name
         self.collection_name = "knowledge_base"
         
-        # Initialize embedding model
-        self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+        # Use ChromaDB's built-in embedding (NO PyTorch, NO sentence-transformers!)
+        self.embedding_fn = embedding_functions.DefaultEmbeddingFunction()
         
         # Get or create collection
         try:
             self.collection = self.client.get_collection(self.collection_name)
         except:
-            self.collection = self.client.create_collection(self.collection_name)
+            self.collection = self.client.create_collection(
+                name=self.collection_name,
+                embedding_function=self.embedding_fn
+            )
     
     def add_document(self, text: str, metadata: Dict, doc_id: str):
         """Add a document to the vector database"""
-        embedding = self.embedding_model.encode(text).tolist()
-        
         self.collection.add(
-            embeddings=[embedding],
             documents=[text],
             metadatas=[metadata],
             ids=[doc_id]
@@ -37,10 +37,8 @@ class RAGSystem:
     
     def search(self, query: str, top_k: int = 3) -> List[Dict]:
         """Search for similar documents"""
-        query_embedding = self.embedding_model.encode(query).tolist()
-        
         results = self.collection.query(
-            query_embeddings=[query_embedding],
+            query_texts=[query],
             n_results=top_k
         )
         
