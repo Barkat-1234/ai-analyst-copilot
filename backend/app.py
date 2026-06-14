@@ -26,12 +26,6 @@ from sqlglot import parse_one, errors
 from functools import lru_cache
 from contextlib import contextmanager
 
-# Note: redis and slowapi are optional - commenting out for simpler deployment
-# import redis
-# from slowapi import Limiter, _rate_limit_exceeded_handler
-# from slowapi.util import get_remote_address
-# from slowapi.errors import RateLimitExceeded
-
 load_dotenv()
 
 # ==================== CONFIGURATION ====================
@@ -47,11 +41,11 @@ MAX_ROWS_LIMIT = 500
 FORBIDDEN_SQL_KEYWORDS = ['DROP', 'DELETE', 'UPDATE', 'INSERT', 'ALTER', 'CREATE', 'TRUNCATE', 'GRANT', 'REVOKE', 'MERGE', 'REPLACE']
 
 # Cache Configuration
-SCHEMA_CACHE_TTL = 3600  # 1 hour
+SCHEMA_CACHE_TTL = 3600
 QUERY_CACHE_MAX_SIZE = 100
-QUERY_CACHE_TTL = 300  # 5 minutes
+QUERY_CACHE_TTL = 300
 
-# PostgreSQL Setup with Connection Pooling
+# PostgreSQL Setup
 DATABASE_URL = os.getenv('DATABASE_URL')
 engine = create_engine(
     DATABASE_URL, 
@@ -70,52 +64,47 @@ model = genai.GenerativeModel('gemini-2.5-flash-lite')
 
 app = FastAPI(title="AI Data Analyst Copilot", version="4.0.0")
 
-# ==================== CORS MIDDLEWARE (FIXED - CRITICAL) ====================
+# ==================== CORS MIDDLEWARE ====================
 
-# Define allowed origins - your frontend URLs
 ALLOWED_ORIGINS = [
     "http://localhost:8501",
     "http://localhost:8000",
-    "https://ai-analyst-frontend-2k26.onrender.com",
-    "https://ai-analyst.onrender.com",
-    "https://ai-analyst-copilot-2.onrender.com",
+    "https://data-analyst-copilot-ui.onrender.com",
+    "https://ai-analyst-copilot-s5og.onrender.com",
 ]
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS", "PUT", "DELETE"],  # OPTIONS is CRITICAL for CORS
+    allow_methods=["GET", "POST", "OPTIONS", "PUT", "DELETE"],
     allow_headers=["*"],
     expose_headers=["*"],
-    max_age=3600,  # Cache preflight requests for 1 hour
+    max_age=3600,
 )
 
 app.add_middleware(
     TrustedHostMiddleware,
-    allowed_hosts=["*"]  # Allow all hosts for now
+    allowed_hosts=["*"]
 )
 
 # ==================== SQL VALIDATION ====================
 
 def validate_sql_ast(sql_query: str) -> Tuple[bool, str]:
-    """Use sqlglot to validate SQL syntax and structure"""
     try:
         parsed = parse_one(sql_query, dialect="postgres")
-        
-        # Check if it's a SELECT statement
         first_keyword = str(parsed).upper().split()[0] if parsed else ""
         if first_keyword != 'SELECT':
             return False, "Only SELECT statements are allowed"
-        
         return True, "Valid SQL"
     except errors.ParseError as e:
         return False, f"SQL syntax error: {str(e)}"
 
 def enforce_limit(sql_query: str) -> str:
-    """Enforce row limit on SQL queries"""
-    sql_upper = sql_query.upper()
+    # Remove any semicolon before adding LIMIT (FIXED)
+    sql_query = sql_query.rstrip(';').strip()
     
+    sql_upper = sql_query.upper()
     if 'LIMIT' in sql_upper:
         import re
         pattern = r'LIMIT\s+(\d+)'
@@ -130,14 +119,23 @@ def enforce_limit(sql_query: str) -> str:
     return sql_query
 
 def validate_sql_readonly(sql_query: str) -> Tuple[bool, str]:
-    """Validate SQL is read-only"""
     sql_upper = sql_query.upper()
-    
     for keyword in FORBIDDEN_SQL_KEYWORDS:
         if re.search(rf'\b{keyword}\b', sql_upper):
             return False, f"SQL contains forbidden keyword: {keyword}"
-    
     return True, "OK"
+
+# ==================== CLEAN SQL FUNCTION - FIXED ====================
+
+def clean_sql(sql_text: str) -> str:
+    """Remove markdown, backticks, and semicolons from SQL"""
+    sql_text = re.sub(r'```sql\s*', '', sql_text)
+    sql_text = re.sub(r'```\s*', '', sql_text)
+    sql_text = re.sub(r'`', '', sql_text)
+    sql_text = re.sub(r'^sql\s*', '', sql_text, flags=re.IGNORECASE)
+    # Remove semicolons (FIXED)
+    sql_text = sql_text.replace(';', '')
+    return sql_text.strip()
 
 # ==================== CACHE MANAGEMENT ====================
 
@@ -167,11 +165,9 @@ class PerUserCache:
     
     def set(self, user_email: str, question: str, schema_hash: str, data: Dict) -> None:
         key = self._get_user_key(user_email, question, schema_hash)
-        
         if len(self._cache) >= self.max_size:
             oldest_key = min(self._cache.keys(), key=lambda k: self._cache[k]['timestamp'])
             del self._cache[oldest_key]
-        
         self._cache[key] = {
             'data': data,
             'timestamp': time.time(),
@@ -277,7 +273,6 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
     )
-    
     try:
         payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
         email = payload.get("sub")
@@ -299,13 +294,6 @@ def require_role(required_role: str):
     return role_checker
 
 # ==================== HELPER FUNCTIONS ====================
-
-def clean_sql(sql_text: str) -> str:
-    sql_text = re.sub(r'```sql\s*', '', sql_text)
-    sql_text = re.sub(r'```\s*', '', sql_text)
-    sql_text = re.sub(r'`', '', sql_text)
-    sql_text = re.sub(r'^sql\s*', '', sql_text, flags=re.IGNORECASE)
-    return sql_text.strip()
 
 def convert_value(val):
     if val is None:
@@ -363,18 +351,15 @@ async def ask(
     start_time = time.time()
     
     try:
-        # Get cached schema with hash
         schema, schema_hash = get_schema_info_cached()
         schema_text = format_schema_for_prompt(schema)
         
-        # Check cache
         cached = query_cache.get(current_user.email, req.question, schema_hash)
         if cached:
             cached["metadata"]["cached"] = True
             cached["request_id"] = request_id
             return cached
         
-        # Generate SQL
         sql_prompt = f"""Database Schema:
 {schema_text}
 
@@ -385,21 +370,17 @@ Write ONLY the SQL query (SELECT only):"""
         sql_response = model.generate_content(sql_prompt)
         sql_query = clean_sql(sql_response.text.strip())
         
-        # Security validations
         is_valid_ro, ro_error = validate_sql_readonly(sql_query)
         if not is_valid_ro:
             raise HTTPException(status_code=403, detail=ro_error)
         
-        # Enforce row limit
         sql_query = enforce_limit(sql_query)
         
-        # Execute query
         with engine.connect() as conn:
             result = conn.execute(text(sql_query))
             rows = result.fetchall()
             columns = list(result.keys())
             
-            # Convert to dict list
             data = []
             for row in rows[:MAX_ROWS_RETURN]:
                 row_dict = {}
@@ -409,7 +390,6 @@ Write ONLY the SQL query (SELECT only):"""
         
         duration_ms = round((time.time() - start_time) * 1000, 2)
         
-        # Generate metrics
         metrics = []
         if data:
             df = pd.DataFrame(data)
@@ -433,7 +413,6 @@ Write ONLY the SQL query (SELECT only):"""
                 "format_type": "integer"
             })
         
-        # Generate chart config
         chart = None
         if data and len(data) > 0:
             df = pd.DataFrame(data)
