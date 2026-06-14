@@ -11,6 +11,7 @@ import uvicorn
 from sqlalchemy import create_engine, text, inspect
 from sqlalchemy.pool import QueuePool
 import pandas as pd
+import numpy as np
 from decimal import Decimal
 import json
 from typing import List, Dict, Any, Optional, Tuple
@@ -19,22 +20,20 @@ import hashlib
 from datetime import datetime, timedelta
 from jose import JWTError, jwt
 import uuid
-import sqlglot
-from sqlglot import parse_one, errors
 import traceback
 
 load_dotenv()
 
 # ==================== CONFIGURATION ====================
 
-SECRET_KEY = os.getenv("JWT_SECRET_KEY", "your-super-secret-key-change-this-in-production")
+SECRET_KEY = os.getenv("JWT_SECRET_KEY", "your-super-secret-key")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "480"))
+ACCESS_TOKEN_EXPIRE_MINUTES = 480
 MAX_ROWS_LIMIT = 500
-MAX_ROWS_RETURN = 1000
-FORBIDDEN_SQL_KEYWORDS = ['DROP', 'DELETE', 'UPDATE', 'INSERT', 'ALTER', 'CREATE', 'TRUNCATE', 'GRANT', 'REVOKE']
+MAX_ROWS_RETURN = 100
+FORBIDDEN_SQL_KEYWORDS = ['DROP', 'DELETE', 'UPDATE', 'INSERT', 'ALTER', 'CREATE', 'TRUNCATE']
 
-# Request counter for monitoring
+# Request counter
 request_counter = 0
 total_response_time = 0
 error_counter = 0
@@ -47,9 +46,9 @@ engine = create_engine(DATABASE_URL, poolclass=QueuePool, pool_size=10, max_over
 genai.configure(api_key=os.getenv('GOOGLE_API_KEY'))
 model = genai.GenerativeModel('gemini-2.5-flash-lite')
 
-app = FastAPI(title="AI Data Analyst Copilot", version="6.0.0")
+app = FastAPI(title="AI Data Analyst Copilot", version="7.0.0")
 
-# ==================== CORS MIDDLEWARE ====================
+# ==================== CORS ====================
 
 ALLOWED_ORIGINS = [
     "http://localhost:8501",
@@ -68,10 +67,173 @@ app.add_middleware(
     max_age=3600,
 )
 
-app.add_middleware(
-    TrustedHostMiddleware,
-    allowed_hosts=["*"]
-)
+# ==================== 1. CHART/KPI DECISION ENGINE ====================
+
+class ChartDecisionEngine:
+    """Intelligently decides the best chart type based on data patterns"""
+    
+    @staticmethod
+    def detect_data_patterns(df: pd.DataFrame) -> Dict[str, Any]:
+        """Analyze data patterns to recommend best visualization"""
+        patterns = {
+            "has_time_series": False,
+            "has_categories": False,
+            "has_numeric": False,
+            "row_count": len(df),
+            "numeric_columns": [],
+            "categorical_columns": [],
+            "time_columns": []
+        }
+        
+        for col in df.columns:
+            if pd.api.types.is_numeric_dtype(df[col]):
+                patterns["numeric_columns"].append(col)
+                patterns["has_numeric"] = True
+            elif pd.api.types.is_datetime64_any_dtype(df[col]):
+                patterns["time_columns"].append(col)
+                patterns["has_time_series"] = True
+            elif df[col].nunique() < 15:
+                patterns["categorical_columns"].append(col)
+                patterns["has_categories"] = True
+        
+        return patterns
+    
+    @staticmethod
+    def decide_chart(df: pd.DataFrame, question: str, patterns: Dict) -> Dict[str, Any]:
+        """Decide the best chart type based on data and question intent"""
+        question_lower = question.lower()
+        
+        chart_config = {
+            "type": "bar",
+            "x_column": None,
+            "y_column": None,
+            "title": "Data Visualization",
+            "recommended": True
+        }
+        
+        if patterns["has_time_series"] and patterns["numeric_columns"]:
+            chart_config["type"] = "line"
+            chart_config["x_column"] = patterns["time_columns"][0]
+            chart_config["y_column"] = patterns["numeric_columns"][0]
+            chart_config["title"] = f"Trend of {patterns['numeric_columns'][0]} over time"
+            
+        elif patterns["has_categories"] and patterns["numeric_columns"]:
+            chart_config["type"] = "bar"
+            chart_config["x_column"] = patterns["categorical_columns"][0]
+            chart_config["y_column"] = patterns["numeric_columns"][0]
+            chart_config["title"] = f"{patterns['numeric_columns'][0]} by {patterns['categorical_columns'][0]}"
+            
+            if patterns["row_count"] <= 6 and "pie" in question_lower:
+                chart_config["type"] = "pie"
+                
+        elif len(patterns["numeric_columns"]) >= 2:
+            chart_config["type"] = "scatter"
+            chart_config["x_column"] = patterns["numeric_columns"][0]
+            chart_config["y_column"] = patterns["numeric_columns"][1]
+            chart_config["title"] = f"{patterns['numeric_columns'][1]} vs {patterns['numeric_columns'][0]}"
+        
+        return chart_config
+
+    @staticmethod
+    def generate_kpi_metrics(df: pd.DataFrame, patterns: Dict) -> List[Dict]:
+        """Generate relevant KPI metrics from data"""
+        metrics = []
+        
+        metrics.append({
+            "key": "total_records",
+            "label": "Total Records",
+            "value": str(len(df)),
+            "icon": "📋"
+        })
+        
+        for col in patterns["numeric_columns"][:3]:
+            total = df[col].sum()
+            avg = df[col].mean()
+            
+            is_currency = "revenue" in col.lower() or "price" in col.lower() or "sales" in col.lower()
+            format_str = lambda x: f"${x:,.2f}" if is_currency else f"{x:,.0f}"
+            
+            metrics.append({
+                "key": f"total_{col}",
+                "label": f"Total {col.replace('_', ' ').title()}",
+                "value": format_str(total),
+                "icon": "💰" if is_currency else "📊"
+            })
+            
+            metrics.append({
+                "key": f"avg_{col}",
+                "label": f"Avg {col.replace('_', ' ').title()}",
+                "value": format_str(avg),
+                "icon": "📈"
+            })
+        
+        return metrics
+
+# ==================== 2. INSIGHT GENERATION LAYER ====================
+
+class InsightGenerator:
+    """Generates business insights from data without exposing raw dataframes"""
+    
+    @staticmethod
+    def generate_insights(df: pd.DataFrame, question: str, patterns: Dict) -> Dict[str, Any]:
+        """Generate structured insights from data"""
+        
+        insights = {
+            "summary": "",
+            "key_findings": [],
+            "recommendations": [],
+            "anomalies": []
+        }
+        
+        summary_parts = []
+        summary_parts.append(f"Analysis of {len(df)} records")
+        
+        if patterns["numeric_columns"]:
+            top_col = patterns["numeric_columns"][0]
+            total = df[top_col].sum()
+            avg = df[top_col].mean()
+            summary_parts.append(f"Total {top_col}: {total:,.2f}")
+            summary_parts.append(f"Average {top_col}: {avg:,.2f}")
+        
+        insights["summary"] = ", ".join(summary_parts)
+        
+        if patterns["categorical_columns"] and patterns["numeric_columns"]:
+            cat_col = patterns["categorical_columns"][0]
+            num_col = patterns["numeric_columns"][0]
+            
+            grouped = df.groupby(cat_col)[num_col].sum().sort_values(ascending=False)
+            
+            if len(grouped) > 0:
+                top_item = grouped.index[0]
+                top_value = grouped.iloc[0]
+                insights["key_findings"].append(f"Top performer: {top_item} with {top_value:,.2f}")
+                
+                if len(grouped) > 1:
+                    bottom_item = grouped.index[-1]
+                    bottom_value = grouped.iloc[-1]
+                    insights["key_findings"].append(f"Lowest performer: {bottom_item} with {bottom_value:,.2f}")
+                    
+                    ratio = top_value / bottom_value if bottom_value > 0 else 0
+                    if ratio > 2:
+                        insights["key_findings"].append(f"Top performer is {ratio:.1f}x higher than lowest performer")
+        
+        if patterns["numeric_columns"]:
+            num_col = patterns["numeric_columns"][0]
+            if df[num_col].sum() > 10000:
+                insights["recommendations"].append(f"Strong total {num_col} - consider increasing investment")
+            if df[num_col].mean() > df[num_col].median():
+                insights["recommendations"].append("High-value outliers detected - review top performers")
+        
+        if patterns["numeric_columns"]:
+            num_col = patterns["numeric_columns"][0]
+            mean_val = df[num_col].mean()
+            std_val = df[num_col].std()
+            anomalies = df[df[num_col] > mean_val + 2 * std_val]
+            
+            if len(anomalies) > 0:
+                insights["anomalies"].append(f"Found {len(anomalies)} unusually high values")
+        
+        return insights
 
 # ==================== SQL FUNCTIONS ====================
 
@@ -99,7 +261,6 @@ def validate_sql_readonly(sql_query: str) -> Tuple[bool, str]:
     return True, "OK"
 
 def get_table_names() -> List[str]:
-    """Get list of table names for better prompting"""
     inspector = inspect(engine)
     return inspector.get_table_names()
 
@@ -226,13 +387,6 @@ def convert_value(val):
         return val.isoformat()
     return str(val)
 
-def format_currency(value: float) -> str:
-    if value >= 1_000_000:
-        return f"${value:,.2f}M"
-    elif value >= 1_000:
-        return f"${value:,.2f}"
-    return f"${value:.2f}"
-
 # ==================== API MODELS ====================
 
 class AskRequest(BaseModel):
@@ -259,12 +413,10 @@ def login(login_req: LoginRequest):
 
 @app.api_route("/health", methods=["GET", "HEAD"])
 def health():
-    """Health check endpoint - supports both GET and HEAD requests"""
-    return {"status": "healthy", "version": "6.0.0"}
+    return {"status": "healthy", "version": "7.0.0"}
 
 @app.options("/ask")
 async def options_ask():
-    """Handle CORS preflight requests"""
     return {"message": "OK"}
 
 @app.post("/ask")
@@ -276,37 +428,20 @@ async def ask(
     request_id = str(uuid.uuid4())
     start_time = time.time()
     
-    # Increment request counter
     request_counter += 1
     
     try:
-        # Get schema and tables
         schema = get_schema_info_cached()
         tables = list(schema.keys())
         schema_text = format_schema_for_prompt(schema)
         
-        # Enhanced SQL prompt with table awareness
-        sql_prompt = f"""Database Tables: {tables}
-
-Schema:
-{schema_text}
-
-Question: {req.question}
-
-Instructions:
-1. Write ONLY a SELECT query
-2. Use the exact table and column names from schema above
-3. For monthly questions, use DATE_TRUNC('month', date_column) or EXTRACT
-4. Return ONLY the SQL query, no explanations
-
-SQL:"""
+        sql_prompt = f"""Tables: {tables}\nSchema:\n{schema_text}\nQuestion: {req.question}\nSQL:"""
         
         sql_response = model.generate_content(sql_prompt)
         sql_query = clean_sql(sql_response.text.strip())
         
         print(f"Generated SQL: {sql_query}")
         
-        # Validate
         is_valid, error_msg = validate_sql_readonly(sql_query)
         if not is_valid:
             error_counter += 1
@@ -314,7 +449,6 @@ SQL:"""
         
         sql_query = enforce_limit(sql_query)
         
-        # Execute
         with engine.connect() as conn:
             result = conn.execute(text(sql_query))
             rows = result.fetchall()
@@ -332,73 +466,56 @@ SQL:"""
                     row_dict[col] = val
                 data.append(row_dict)
         
-        duration_ms = round((time.time() - start_time) * 1000, 2)
-        total_response_time += duration_ms
+        if not data:
+            return {
+                "success": True,
+                "answer": "No data found",
+                "metrics": [],
+                "chart": None,
+                "insights": {"summary": "No data available"},
+                "data": [],
+                "metadata": {"row_count": 0}
+            }
         
-        # Generate metrics
-        metrics = []
-        if data:
-            df = pd.DataFrame(data)
-            numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
-            
-            if 'revenue' in numeric_cols:
-                total_revenue = df['revenue'].sum()
-                metrics.append({
-                    "key": "total_revenue",
-                    "label": "Total Revenue",
-                    "value": format_currency(total_revenue),
-                    "icon": "💰",
-                    "format_type": "currency"
-                })
-            
-            metrics.append({
-                "key": "record_count",
-                "label": "Records",
-                "value": str(len(data)),
-                "icon": "📋",
-                "format_type": "integer"
-            })
+        df = pd.DataFrame(data)
+        
+        # Detect patterns
+        patterns = ChartDecisionEngine.detect_data_patterns(df)
         
         # Generate chart config
-        chart = None
-        if data and len(data) > 0:
-            df = pd.DataFrame(data)
-            text_cols = df.select_dtypes(include=['object']).columns.tolist()
-            numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
-            if text_cols and numeric_cols:
-                chart = {
-                    "type": "bar",
-                    "x_column": text_cols[0],
-                    "y_column": numeric_cols[0],
-                    "title": f"{numeric_cols[0]} by {text_cols[0]}"
-                }
+        chart_config = ChartDecisionEngine.decide_chart(df, req.question, patterns)
         
-        # Generate answer
-        if data:
-            answer_prompt = f"""Question: {req.question}
-Data summary: {len(data)} records found
-First few rows: {data[:3]}
-
-Provide a brief business answer (1-2 sentences):"""
-            answer = model.generate_content(answer_prompt).text
-        else:
-            answer = f"No data found for: {req.question}"
+        # Generate KPI metrics
+        kpi_metrics = ChartDecisionEngine.generate_kpi_metrics(df, patterns)
+        
+        # Generate insights
+        insights = InsightGenerator.generate_insights(df, req.question, patterns)
+        
+        # Generate business answer
+        answer_prompt = f"""Question: {req.question}
+Insights: {json.dumps(insights, indent=2)}
+Provide a concise business answer (2-3 sentences):"""
+        
+        answer = model.generate_content(answer_prompt).text
+        
+        duration_ms = round((time.time() - start_time) * 1000, 2)
+        total_response_time += duration_ms
         
         response = {
             "success": True,
             "answer": answer,
-            "data": data,
-            "metrics": metrics,
-            "chart": chart,
+            "metrics": kpi_metrics,
+            "chart": chart_config,
+            "insights": insights,
+            "data": data[:20],
             "metadata": {
                 "row_count": len(data),
                 "query_time_ms": duration_ms,
                 "sql_used": sql_query,
-                "user": current_user.email,
-                "tables": tables
+                "user": current_user.email
             },
             "request_id": request_id,
-            "api_version": "6.0.0"
+            "api_version": "7.0.0"
         }
         
         return response
@@ -409,45 +526,36 @@ Provide a brief business answer (1-2 sentences):"""
     except Exception as e:
         error_counter += 1
         error_full = traceback.format_exc()
-        print(f"ERROR in /ask: {error_full}")
+        print(f"ERROR: {error_full}")
         
         return {
             "success": False,
             "answer": f"Error: {str(e)[:200]}",
-            "data": [],
             "metrics": [],
             "chart": None,
-            "metadata": {
-                "error": str(e),
-                "traceback": error_full[:500],
-                "sql_attempted": sql_query if 'sql_query' in locals() else "None"
-            },
+            "insights": {},
+            "data": [],
+            "metadata": {"error": str(e)},
             "request_id": request_id,
-            "api_version": "6.0.0"
+            "api_version": "7.0.0"
         }
 
 @app.get("/monitoring/stats")
 async def get_monitoring_stats(current_user: TokenData = Depends(require_role("admin"))):
     global request_counter, total_response_time, error_counter
     
-    avg_response_time = 0
-    if request_counter > 0:
-        avg_response_time = total_response_time / request_counter
-    
-    error_rate = 0
-    if request_counter > 0:
-        error_rate = (error_counter / request_counter) * 100
+    avg_response_time = round(total_response_time / request_counter, 2) if request_counter > 0 else 0
+    error_rate = round((error_counter / request_counter) * 100, 2) if request_counter > 0 else 0
     
     return {
         "total_requests": request_counter,
-        "avg_response_time_ms": round(avg_response_time, 2),
-        "error_rate": round(error_rate, 2),
+        "avg_response_time_ms": avg_response_time,
+        "error_rate": error_rate,
         "status": "healthy"
     }
 
 @app.get("/tables")
 async def get_tables(current_user: TokenData = Depends(get_current_user)):
-    """List all tables in database"""
     tables = get_table_names()
     return {"tables": tables}
 
