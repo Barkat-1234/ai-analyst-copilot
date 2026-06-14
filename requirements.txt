@@ -12,3 +12,4 @@ requests
 sqlglot
 passlib
 chromadb
+groq
