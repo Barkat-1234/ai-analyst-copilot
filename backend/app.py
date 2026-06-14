@@ -23,7 +23,6 @@ import uuid
 import asyncio
 import sqlglot
 from sqlglot import parse_one, errors
-from passlib.context import CryptContext
 from contextlib import contextmanager
 
 load_dotenv()
@@ -42,9 +41,6 @@ RATE_LIMIT_REQUESTS = 20
 RATE_LIMIT_PERIOD = 60  # seconds
 
 FORBIDDEN_SQL_KEYWORDS = ['DROP', 'DELETE', 'UPDATE', 'INSERT', 'ALTER', 'CREATE', 'TRUNCATE', 'GRANT', 'REVOKE', 'MERGE', 'REPLACE']
-
-# Password hashing
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 # Cache Configuration
 SCHEMA_CACHE_TTL = 3600
@@ -118,15 +114,19 @@ def check_rate_limit(user_email: str) -> Tuple[bool, int]:
     rate_limit_storage[key].append(now)
     return True, 0
 
-# ==================== PASSWORD HASHING ====================
+# ==================== SIMPLE PASSWORD HASHING (NO BCRYPT) ====================
 
 def hash_password(password: str) -> str:
-    """Hash a password using bcrypt"""
-    return pwd_context.hash(password)
+    """Hash a password using SHA256 (simple, no bcrypt issues)"""
+    return hashlib.sha256(password.encode()).hexdigest()
 
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """Verify a password against its hash"""
-    return pwd_context.verify(plain_password, hashed_password)
+def verify_password(plain_password: str, stored_password: str) -> bool:
+    """Verify a password - supports both plain text and SHA256 hash"""
+    # Check plain text first (for existing users)
+    if plain_password == stored_password:
+        return True
+    # Check SHA256 hash
+    return hash_password(plain_password) == stored_password
 
 # ==================== SQL VALIDATION ====================
 
@@ -143,7 +143,6 @@ def validate_sql_ast(sql_query: str) -> Tuple[bool, str]:
 
 def check_multiple_statements(sql_query: str) -> Tuple[bool, str]:
     """Block multiple SQL statements separated by semicolons"""
-    # Count semicolons not inside quotes
     in_quote = False
     semicolon_count = 0
     
@@ -286,7 +285,7 @@ def format_schema_for_prompt(schema: Dict[str, Any]) -> str:
             result += "\n"
     return result
 
-# ==================== AUTHENTICATION WITH PASSWORD HASHING ====================
+# ==================== AUTHENTICATION ====================
 
 security = HTTPBearer()
 
@@ -323,7 +322,6 @@ def authenticate_user(email: str, password: str):
     user = get_user_from_db(email)
     if not user:
         return None
-    # Use password hashing verification
     if verify_password(password, user["password"]):
         return user
     return None
