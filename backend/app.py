@@ -22,6 +22,9 @@ from jose import JWTError, jwt
 import uuid
 import traceback
 
+# Import RAG system
+from rag import RAGSystem
+
 load_dotenv()
 
 # ==================== CONFIGURATION ====================
@@ -41,6 +44,9 @@ error_counter = 0
 # Database
 DATABASE_URL = os.getenv('DATABASE_URL')
 engine = create_engine(DATABASE_URL, poolclass=QueuePool, pool_size=10, max_overflow=20, pool_pre_ping=True)
+
+# Initialize RAG System
+rag = RAGSystem()
 
 # Gemini - Using gemini-2.0-flash
 genai.configure(api_key=os.getenv('GOOGLE_API_KEY'))
@@ -431,16 +437,36 @@ async def ask(
     request_counter += 1
     
     try:
+        # ==================== RAG STEP 1: SEARCH KNOWLEDGE BASE ====================
+        rag_results = rag.search(req.question, top_k=3)
+        
+        # Build context from RAG results
+        rag_context = ""
+        if rag_results:
+            rag_context = "\n\nRelevant Knowledge from Database:\n"
+            for i, result in enumerate(rag_results, 1):
+                rag_context += f"{i}. {result['content']}\n"
+        
         schema = get_schema_info_cached()
         tables = list(schema.keys())
         schema_text = format_schema_for_prompt(schema)
         
-        sql_prompt = f"""Tables: {tables}\nSchema:\n{schema_text}\nQuestion: {req.question}\nSQL:"""
+        # ==================== RAG STEP 2: AUGMENT PROMPT WITH CONTEXT ====================
+        sql_prompt = f"""Tables: {tables}
+Schema:
+{schema_text}
+{rag_context}
+
+Question: {req.question}
+
+Use the schema above and any relevant knowledge to write the SQL query.
+SQL:"""
         
         sql_response = model.generate_content(sql_prompt)
         sql_query = clean_sql(sql_response.text.strip())
         
         print(f"Generated SQL: {sql_query}")
+        print(f"RAG Context Used: {len(rag_results)} documents retrieved")
         
         is_valid, error_msg = validate_sql_readonly(sql_query)
         if not is_valid:
@@ -473,6 +499,7 @@ async def ask(
                 "metrics": [],
                 "chart": None,
                 "insights": {"summary": "No data available"},
+                "rag_used": len(rag_results) > 0,
                 "data": [],
                 "metadata": {"row_count": 0}
             }
@@ -491,10 +518,12 @@ async def ask(
         # Generate insights
         insights = InsightGenerator.generate_insights(df, req.question, patterns)
         
-        # Generate business answer
+        # ==================== RAG STEP 3: USE RAG CONTEXT IN ANSWER ====================
         answer_prompt = f"""Question: {req.question}
 Insights: {json.dumps(insights, indent=2)}
-Provide a concise business answer (2-3 sentences):"""
+{rag_context}
+
+Provide a concise business answer (2-3 sentences). If the knowledge base has relevant information, incorporate it:"""
         
         answer = model.generate_content(answer_prompt).text
         
@@ -507,6 +536,8 @@ Provide a concise business answer (2-3 sentences):"""
             "metrics": kpi_metrics,
             "chart": chart_config,
             "insights": insights,
+            "rag_used": len(rag_results) > 0,
+            "rag_sources": [r["content"][:200] for r in rag_results] if rag_results else [],
             "data": data[:20],
             "metadata": {
                 "row_count": len(data),
@@ -534,6 +565,7 @@ Provide a concise business answer (2-3 sentences):"""
             "metrics": [],
             "chart": None,
             "insights": {},
+            "rag_used": False,
             "data": [],
             "metadata": {"error": str(e)},
             "request_id": request_id,
